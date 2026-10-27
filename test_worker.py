@@ -1,13 +1,18 @@
 """Workshop worker: the whole job with a fake server and a synthetic mesh (no COLMAP, no GPU)."""
 
+import io
 import sys
 
+import numpy as np
 import pytest
 import trimesh
+from PIL import Image
 
+import relief
 import workshop_worker as w
 
 MB = 1024 * 1024
+OK = {"relief": None, "full": None, "video": None}  # a PC that can build everything
 
 
 def make_ply(path, faces_sub=3):
@@ -15,6 +20,15 @@ def make_ply(path, faces_sub=3):
     m.apply_scale([20, 15, 4])  # a flattened relief-like shape, in arbitrary units
     m.export(path)
     return path
+
+
+def _jpeg():
+    buf = io.BytesIO()
+    Image.fromarray(np.random.default_rng(3).integers(0, 255, (60, 80, 3), dtype=np.uint8)).save(buf, "JPEG")
+    return buf.getvalue()
+
+
+JPEG = _jpeg()
 
 
 class FakeResp:
@@ -43,7 +57,7 @@ class FakeHttp:
         self.uploads = {}
 
     def get(self, url, **kw):
-        return FakeResp(200, b"jpegbytes")
+        return FakeResp(200, JPEG)
 
     def request(self, method, url, data=None, **kw):
         if hasattr(data, "read"):
@@ -238,19 +252,139 @@ def test_an_artisan_gets_no_manager_warning(monkeypatch, capsys):
     assert "only process product scans" not in capsys.readouterr().out
 
 
-def test_a_missing_tool_leaves_the_scan_waiting_instead_of_failing_it(tmp_path, fake_http):
-    api = FakeApi(scans=[scan("needs001")])
+def test_capabilities_follow_the_hardware(monkeypatch):
+    monkeypatch.setattr(w.shutil, "which", lambda name: name)  # every tool "exists"
+    monkeypatch.setattr(w.importlib.util, "find_spec", lambda name: object())  # torch and transformers too
+    assert w.capabilities(gpu=True) == OK
+    no_gpu = w.capabilities(gpu=False)
+    assert no_gpu["relief"] is None and "NVIDIA GPU" in no_gpu["full"]  # a CPU-only PC still does flat carvings
+    monkeypatch.setattr(w.shutil, "which", lambda name: None if name in ("colmap", "ffmpeg") else name)
+    bare = w.capabilities(gpu=True)
+    assert "COLMAP" in bare["full"] and "ffmpeg" in bare["video"] and bare["relief"] is None
+    monkeypatch.setattr(w.importlib.util, "find_spec", lambda name: None)
+    assert "torch" in w.capabilities(gpu=True)["relief"]
+
+
+def test_the_mode_flag_can_turn_a_route_off(monkeypatch):
+    monkeypatch.setattr(w.shutil, "which", lambda name: name)
+    monkeypatch.setattr(w.importlib.util, "find_spec", lambda name: object())
+    assert "turned off" in w.capabilities(mode="relief", gpu=True)["full"]
+    assert "turned off" in w.capabilities(mode="full", gpu=True)["relief"]
+    assert w.capabilities(mode="auto", gpu=True) == OK
+
+
+def test_gpu_detection_needs_a_working_nvidia_smi(monkeypatch):
+    monkeypatch.setattr(w.shutil, "which", lambda name: None)
+    assert w.gpu_available() is False
+    monkeypatch.setattr(w.shutil, "which", lambda name: name)
+    ran = type("R", (), {"returncode": 0, "stdout": "GPU 0: NVIDIA GeForce RTX 3060 (UUID: x)"})()
+    monkeypatch.setattr(w.subprocess, "run", lambda *a, **k: ran)
+    assert w.gpu_available() is True
+    monkeypatch.setattr(w.subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 9, "stdout": ""})())
+    assert w.gpu_available() is False
+
+
+def test_what_this_pc_cannot_build_stays_waiting_and_the_rest_is_built(tmp_path, fake_http):
+    cpu_only = {"relief": None, "full": "full 3D needs an NVIDIA GPU, and none was found", "video": None}
+    flat = {**scan("flat0001"), "params": {"shape": "relief"}}
+    solid = scan("full0001")  # no shape = full
+    api = FakeApi(scans=[solid, flat], photos=1)
     logs = []
-    handled = w.run_once(api, tmp_path, log=logs.append, colmap="no-such-colmap-anywhere")
-    assert handled == 0 and api.calls == []  # never claimed, so never failed
-    assert any("left needs001 waiting" in line and "COLMAP was not found" in line for line in logs)
+    handled = w.run_once(api, tmp_path, log=logs.append, caps=cpu_only, estimate=gradient_depth)
+    assert handled == 1 and api.calls.count("claim") == 1 and api.calls.count("finish") == 1
+    assert any("left full0001 waiting" in line and "NVIDIA GPU" in line for line in logs)
+    assert not any("left flat0001" in line for line in logs)
 
 
-def test_video_scans_also_wait_for_ffmpeg(tmp_path, fake_http):
-    video = {**scan("vid00001"), "source_kind": "video"}
-    assert w.missing_tool(video, colmap=sys.executable, ffmpeg="no-such-ffmpeg") and "ffmpeg" in w.missing_tool(video, sys.executable, "no-such-ffmpeg")
-    assert w.missing_tool({**video, "source_kind": "photos"}, colmap=sys.executable, ffmpeg="no-such-ffmpeg") is None
-    assert w.missing_tool(video, colmap=sys.executable, ffmpeg=sys.executable) is None
+def test_a_video_scan_waits_for_ffmpeg_but_a_photo_scan_does_not():
+    no_ffmpeg = {**OK, "video": "video scans need ffmpeg, which was not found ('ffmpeg')"}
+    video = {**scan("v"), "source_kind": "video"}
+    assert "ffmpeg" in w.cannot_run(video, no_ffmpeg)
+    assert w.cannot_run({**video, "source_kind": "photos"}, no_ffmpeg) is None
+
+
+# ------------------------------------------------------------------ flat carving (relief)
+def gradient_depth(photo):
+    """A stand-in depth estimate: a smooth bump, nearest in the middle."""
+    y, x = np.mgrid[-1:1:120j, -1:1:160j]
+    return np.clip(1 - np.hypot(x, y), 0, 1).astype(np.float32)
+
+
+def write_photo(path, noise):
+    rng = np.random.default_rng(1)
+    base = np.full((200, 300), 120.0)
+    if noise:
+        base = base + rng.normal(0, noise, base.shape)
+    Image.fromarray(np.clip(base, 0, 255).astype(np.uint8)).convert("RGB").save(path)
+    return path
+
+
+def test_the_sharpest_photo_is_chosen(tmp_path):
+    blurry, crisp = write_photo(tmp_path / "a.jpg", 0), write_photo(tmp_path / "b.jpg", 40)
+    assert relief.pick_front([blurry, crisp]) == crisp
+    with pytest.raises(RuntimeError, match="no photo"):
+        relief.pick_front([tmp_path / "notes.txt"])
+
+
+def test_the_relief_mesh_has_the_real_width_and_depth_and_faces_up():
+    d = gradient_depth(None)
+    mesh = relief.relief_mesh(d, width_mm=300, depth_mm=15)
+    lo, hi = mesh.bounds
+    assert hi[0] - lo[0] == pytest.approx(300) and lo[2] == pytest.approx(-15) and hi[2] == pytest.approx(0)
+    assert hi[1] - lo[1] == pytest.approx(300 * (d.shape[0] - 1) / (d.shape[1] - 1))  # same shape as the photo
+    assert mesh.faces.shape[0] == 2 * (d.shape[0] - 1) * (d.shape[1] - 1)
+    assert mesh.face_normals[:, 2].min() >= -1e-9  # every face looks up at the viewer
+    flat = relief.relief_mesh(np.full((20, 30), 0.1), 100)  # all below the floor: one flat background
+    assert flat.extents[2] == pytest.approx(0)
+
+
+def test_shrink_keeps_the_shape_and_never_enlarges():
+    big = np.random.default_rng(0).random((400, 800)).astype(np.float32)
+    assert relief.shrink(big, 200).shape == (100, 200)
+    assert relief.shrink(big, 5000) is big
+
+
+def test_a_flat_carving_job_needs_no_colmap_and_uploads_model_depth_and_gcode(tmp_path, fake_http):
+    api = FakeApi(photos=1)
+    used = []
+
+    def estimate(photo):
+        used.append("depth")
+        return gradient_depth(photo)
+
+    params = {"shape": "relief", "real_width_mm": 40, "gcode": True}
+    out = w.process(api, {**scan(), "params": params}, tmp_path, reconstruct=lambda *a: used.append("colmap"), estimate=estimate)
+    assert out == "done" and api.failed is None
+    assert used == ["depth"]  # COLMAP is never touched for a flat carving
+    assert [a["kind"] for a in api.assets] == ["glb", "stl", "obj", "ply", "render", "nc", "render"]
+    assert all(a["visibility"] == "staff" for a in api.assets)
+    assert "size not set" not in api.assets[0]["alt"]
+
+
+def test_a_flat_carving_without_a_width_still_gets_a_model_but_no_gcode(tmp_path, fake_http):
+    api = FakeApi(photos=1)
+    w.process(api, {**scan(), "params": {"shape": "relief"}}, tmp_path, estimate=gradient_depth)
+    assert [a["kind"] for a in api.assets] == ["glb", "stl", "obj", "ply", "render"]
+    assert "size not set" in api.assets[0]["alt"]  # so nobody trusts its size
+    bad = FakeApi(photos=1)
+    assert w.process(bad, {**scan(), "params": {"shape": "relief", "gcode": True}}, tmp_path, estimate=gradient_depth) == "failed"
+    assert "real width" in bad.failed
+
+
+def test_the_flat_carving_model_is_in_millimetres(tmp_path, fake_http, monkeypatch):
+    kept = {}
+    real = w.export_models
+
+    def spy(mesh, out, stem, **kw):
+        files = real(mesh, out, stem, **kw)
+        kept.update({k: p for p, k in files})
+        return files
+
+    monkeypatch.setattr(w, "export_models", spy)
+    w.process(FakeApi(photos=1), {**scan(), "params": {"shape": "relief", "real_width_mm": 250}}, tmp_path, keep=True, estimate=gradient_depth)
+    stl = trimesh.load(kept["stl"], force="mesh")
+    glb = trimesh.load(kept["glb"], force="mesh")
+    assert stl.extents[0] == pytest.approx(250, rel=1e-3) and glb.extents[0] == pytest.approx(0.25, rel=1e-2)
 
 
 # ------------------------------------------------------------------ the job
@@ -297,21 +431,21 @@ def test_gcode_without_a_width_fails_the_job_clearly(tmp_path, fake_http):
 def test_a_lost_claim_touches_nothing_and_the_queue_moves_on(tmp_path, fake_http):
     api = FakeApi(scans=[scan("lost0001"), scan("mine0002")], lose_claim={"lost0001"})
     logs = []
-    handled = w.run_once(api, tmp_path, log=logs.append, reconstruct=fake_reconstruct)
+    handled = w.run_once(api, tmp_path, log=logs.append, caps=OK, reconstruct=fake_reconstruct)
     assert handled == 1 and api.calls.count("finish") == 1
     assert any("skip lost0001" in line for line in logs)
 
 
 def test_a_scan_with_no_product_or_restoration_is_left_alone(tmp_path, fake_http):
     api = FakeApi(scans=[{"id": "orphan01", "restoration_id": None, "item_id": None, "params": {}}])
-    assert w.run_once(api, tmp_path, log=lambda m: None, reconstruct=fake_reconstruct) == 0
+    assert w.run_once(api, tmp_path, log=lambda m: None, caps=OK, reconstruct=fake_reconstruct) == 0
     assert api.calls == []
 
 
 def test_a_video_scan_is_cut_into_frames_first(tmp_path, fake_http, monkeypatch):
     cut = []
 
-    def fake_frames(video, out, ffmpeg, progress=None):
+    def fake_frames(video, out, ffmpeg, progress=None, min_frames=8):
         cut.append(video.name)
         out.mkdir(parents=True, exist_ok=True)
         return out

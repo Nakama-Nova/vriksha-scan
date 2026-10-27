@@ -15,6 +15,7 @@ step) and, for video scans, ffmpeg, both on PATH or given with --colmap / --ffmp
 import argparse
 import collections
 import getpass
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -26,6 +27,7 @@ from pathlib import Path
 import requests
 import trimesh
 
+import relief
 import vriksha
 
 http = requests  # replaced in tests
@@ -171,7 +173,7 @@ def thin(files, limit=MAX_FRAMES):
     return [files[int(i * step)] for i in range(limit)]
 
 
-def frames_from_video(video, out, ffmpeg="ffmpeg", fps=2, progress=None):
+def frames_from_video(video, out, ffmpeg="ffmpeg", fps=2, progress=None, min_frames=8):
     out.mkdir(parents=True, exist_ok=True)
     run([ffmpeg, "-y", "-i", str(video), "-vf", f"fps={fps}", "-q:v", "2", str(out / "%05d.jpg")], progress)
     frames = sorted(out.glob("*.jpg"))
@@ -179,7 +181,7 @@ def frames_from_video(video, out, ffmpeg="ffmpeg", fps=2, progress=None):
     for f in frames:
         if f not in keep:
             f.unlink()
-    if len(keep) < 8:
+    if len(keep) < min_frames:
         raise RuntimeError("The video gave too few frames. Film slowly all the way around the piece.")
     return out
 
@@ -211,13 +213,17 @@ def colmap_reconstruct(images, workspace, quality, progress, colmap="colmap"):
     return mesh
 
 
-def export_models(mesh_path, out, stem, width_mm=None, limits=None):
-    """Write .glb .stl .obj .ply. The widest side becomes width_mm when known. A model too big
-    for the server is simplified, the same way for every format, until each fits."""
+def export_models(mesh_or_path, out, stem, width_mm=None, limits=None, mm=False):
+    """Write .glb .stl .obj .ply. The widest side becomes width_mm when known (mm=True says the mesh
+    is already in millimetres). A model too big for the server is simplified, the same way for
+    every format, until each fits."""
     limits = limits or LIMITS
     out.mkdir(parents=True, exist_ok=True)
-    mesh = trimesh.load(mesh_path, force="mesh")
-    if width_mm:
+    if isinstance(mesh_or_path, trimesh.Trimesh):
+        mesh = mesh_or_path.copy()
+    else:
+        mesh = trimesh.load(mesh_or_path, force="mesh")
+    if width_mm and not mm:
         mesh.apply_scale(width_mm / max(mesh.extents))
     formats = [(".glb", "glb"), (".stl", "stl"), (".obj", "obj"), (".ply", "ply")]
     while True:
@@ -226,7 +232,7 @@ def export_models(mesh_path, out, stem, width_mm=None, limits=None):
         for ext, kind in formats:
             path = out / f"{stem}{ext}"
             m = mesh.copy()
-            if kind == "glb" and width_mm:
+            if kind == "glb" and (width_mm or mm):
                 m.apply_scale(0.001)  # glTF is in metres; the other formats stay in mm
             m.export(path)
             files.append((path, kind))
@@ -250,6 +256,37 @@ def make_gcode(model_path, out, stem, width_mm):
     return [(nc, "nc"), (png, "render")]
 
 
+def make_gcode_depth(depth_png, out, stem, width_mm):
+    """Relief G-code and a hill-shade preview straight from the depth map (vriksha.py's picture input)."""
+    if not width_mm:
+        raise RuntimeError("G-code needs the real width of the piece. Enter it on the scan and try again.")
+    nc, png = out / f"{stem}.nc", out / f"{stem}-preview.png"
+    argv = [str(depth_png), "--width", str(width_mm), "--max-depth", str(relief.RELIEF_DEPTH_MM), "--floor", str(relief.FLOOR), "-o", str(nc), "--preview", str(png)]
+    c = vriksha.parse(argv)
+    code, tgt, _stats = vriksha.build(c)
+    nc.write_text(code)
+    vriksha.preview(tgt, c.px, png)
+    return [(nc, "nc"), (png, "render")]
+
+
+def relief_files(images, folder, params, progress, estimate=None):
+    """Flat carving: the sharpest photo -> depth map -> relief mesh (+ G-code). Returns the files to upload."""
+    out = folder / "out"
+    out.mkdir(parents=True, exist_ok=True)
+    photo = relief.pick_front(sorted(Path(images).glob("*")))
+    progress.set(15, "Reading the carving's depth (a minute or two on a normal PC)")
+    depth = relief.shrink((estimate or relief.estimate_depth)(photo), relief.DEPTH_SIDE)
+    width = params.get("real_width_mm")
+    progress.set(70, "Making the 3D files")
+    files = export_models(relief.relief_mesh(depth, width or 100.0), out, "relief", mm=True)
+    depth_png = relief.save_depth_png(depth, folder / "depth.png")
+    files.append((relief.save_preview_png(depth, out / "relief-depth.png"), "render"))
+    if params.get("gcode"):
+        progress.set(85, "Making the CNC G-code")
+        files += make_gcode_depth(depth_png, out, "relief", width)
+    return files
+
+
 def upload(api, sid, files, label, progress):
     """Send each result straight to the store with a signed link. Returns the finish() assets."""
     assets = []
@@ -265,9 +302,10 @@ def upload(api, sid, files, label, progress):
     return assets
 
 
-def process(api, scan, work, colmap="colmap", ffmpeg="ffmpeg", reconstruct=None, keep=False):
+def process(api, scan, work, colmap="colmap", ffmpeg="ffmpeg", reconstruct=None, estimate=None, keep=False):
     """One whole job. Raises ApiError if the claim is lost; any other failure is reported to the server."""
     sid, params = scan["id"], scan.get("params") or {}
+    shape = params.get("shape", "full")
     job = api.claim(sid)
     progress = Progress(api, sid)
     label = job.get("item_name") or "Restoration scan"
@@ -277,17 +315,21 @@ def process(api, scan, work, colmap="colmap", ffmpeg="ffmpeg", reconstruct=None,
         sources = download(api, sid, folder / "src", progress)
         if job["source_kind"] == "video":
             progress.set(10, "Cutting the video into frames")
-            images = frames_from_video(sources[0], folder / "frames", ffmpeg, progress=progress)
+            images = frames_from_video(sources[0], folder / "frames", ffmpeg, progress=progress, min_frames=1 if shape == "relief" else 8)
         else:
             images = folder / "src"
-        mesh = reconstruct(images, folder / "colmap", params.get("quality", "normal"), progress)
-        progress.set(80, "Making the 3D files")
-        width = params.get("real_width_mm")
-        files = export_models(mesh, folder / "out", "model", width)
-        if params.get("gcode"):
-            progress.set(88, "Making the CNC G-code")
-            stl = next(p for p, k in files if k == "stl")
-            files += make_gcode(stl, folder / "out", "model", width)
+        if shape == "relief":
+            files = relief_files(images, folder, params, progress, estimate)
+        else:
+            mesh = reconstruct(images, folder / "colmap", params.get("quality", "normal"), progress)
+            progress.set(80, "Making the 3D files")
+            width = params.get("real_width_mm")
+            files = export_models(mesh, folder / "out", "model", width)
+            if params.get("gcode"):
+                progress.set(88, "Making the CNC G-code")
+                stl = next(p for p, k in files if k == "stl")
+                files += make_gcode(stl, folder / "out", "model", width)
+        label = label + ("" if params.get("real_width_mm") else " (size not set)")
         assets = upload(api, sid, files, label, progress)
         api.finish(sid, assets)
         return "done"
@@ -302,28 +344,58 @@ def process(api, scan, work, colmap="colmap", ffmpeg="ffmpeg", reconstruct=None,
             shutil.rmtree(folder, ignore_errors=True)
 
 
-def missing_tool(scan, colmap="colmap", ffmpeg="ffmpeg"):
-    """Why this PC cannot run the scan yet, or None. Checked BEFORE claiming, because a scan
-    that fails here is finished for good and the artisan would have to upload again."""
+def gpu_available():
+    """True when an NVIDIA GPU answers nvidia-smi (COLMAP's dense step needs one)."""
+    if not shutil.which("nvidia-smi"):
+        return False
+    try:
+        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.returncode == 0 and "GPU" in out.stdout
+
+
+def capabilities(colmap="colmap", ffmpeg="ffmpeg", mode="auto", gpu=None):
+    """What this PC can build, as {what: None if it can, else why not}. Looked at again on every pass,
+    so installing a tool or driver while the worker runs is noticed."""
+    caps = {"relief": None, "full": None, "video": None}
+    if importlib.util.find_spec("torch") is None or importlib.util.find_spec("transformers") is None:
+        caps["relief"] = "flat carvings need torch and transformers: pip install -r requirements-relief.txt"
     if not shutil.which(colmap):
-        return f"COLMAP was not found ('{colmap}'). Install it or pass --colmap with its full path"
-    if scan.get("source_kind") == "video" and not shutil.which(ffmpeg):
-        return f"ffmpeg was not found ('{ffmpeg}'), which video scans need"
-    return None
+        caps["full"] = f"full 3D needs COLMAP, which was not found ('{colmap}')"
+    elif not (gpu_available() if gpu is None else gpu):
+        caps["full"] = "full 3D needs an NVIDIA GPU, and none was found"
+    if not shutil.which(ffmpeg):
+        caps["video"] = f"video scans need ffmpeg, which was not found ('{ffmpeg}')"
+    if mode == "relief":
+        caps["full"] = "full 3D is turned off with --mode relief"
+    elif mode == "full":
+        caps["relief"] = "flat carvings are turned off with --mode full"
+    return caps
 
 
-def run_once(api, work, log=print, **kw):
-    """Process every waiting scan, oldest first. Returns how many were handled."""
+def cannot_run(scan, caps):
+    """Why this PC cannot do the scan, or None. Checked BEFORE claiming: a scan that fails is finished
+    for good and the artisan would have to upload again, so one this PC cannot build stays waiting
+    for a PC that can (a GPU PC, for full 3D)."""
+    shape = (scan.get("params") or {}).get("shape", "full")
+    if caps.get(shape):
+        return caps[shape]
+    return caps["video"] if scan.get("source_kind") == "video" else None
+
+
+def run_once(api, work, log=print, caps=None, mode="auto", **kw):
+    """Process every waiting scan this PC can build, oldest first. Returns how many were handled."""
+    caps = caps or capabilities(kw.get("colmap", "colmap"), kw.get("ffmpeg", "ffmpeg"), mode)
     handled = 0
     for scan in api.queue():
         if not scan.get("restoration_id") and not scan.get("item_id"):
             log(f"skip {scan['id'][:8]}: not attached to a product or a restoration")
             continue
-        if kw.get("reconstruct") is None:  # tests inject their own reconstruction
-            problem = missing_tool(scan, kw.get("colmap", "colmap"), kw.get("ffmpeg", "ffmpeg"))
-            if problem:
-                log(f"left {scan['id'][:8]} waiting: {problem}")
-                continue
+        problem = cannot_run(scan, caps)
+        if problem:
+            log(f"left {scan['id'][:8]} waiting: {problem}")
+            continue
         try:
             outcome = process(api, scan, work, **kw)
         except ApiError as exc:
@@ -342,6 +414,7 @@ def main(argv=None):
     p.add_argument("--work-dir", default=str(Path(tempfile.gettempdir()) / "vriksha-worker"))
     p.add_argument("--colmap", default="colmap")
     p.add_argument("--ffmpeg", default="ffmpeg")
+    p.add_argument("--mode", choices=["auto", "full", "relief"], default="auto", help="auto: build what this PC can; or force full 3D or flat carvings only")
     p.add_argument("--once", action="store_true", help="one pass over the queue, then stop")
     p.add_argument("--keep", action="store_true", help="keep each job's working files")
     a = p.parse_args(argv)
@@ -356,13 +429,16 @@ def main(argv=None):
     print(f"signed in to {a.url} as {a.user} ({api.role}); worker '{a.worker}'")
     if api.role == "manager":
         print("note: a manager can only process product scans. Temple restoration scans need an owner or artisan account.")
-    if not shutil.which(a.colmap):
-        print(f"warning: COLMAP was not found ('{a.colmap}'). Scans will wait until it is installed; pass --colmap with its full path.")
+    caps = capabilities(a.colmap, a.ffmpeg, a.mode)
+    for what, label in (("relief", "flat carvings (one photo, any PC)"), ("full", "full 3D objects (photos all around)")):
+        print(f"  {label}: " + ("can build" if not caps[what] else f"waiting for a PC that can ({caps[what]})"))
+    if caps["video"]:
+        print(f"  note: {caps['video']}")
     print(f"waiting for scans, checking every {POLL_SECONDS} s. Press Ctrl+C to stop.")
     try:
         while True:
             try:
-                handled = run_once(api, a.work_dir, colmap=a.colmap, ffmpeg=a.ffmpeg, keep=a.keep)
+                handled = run_once(api, a.work_dir, mode=a.mode, colmap=a.colmap, ffmpeg=a.ffmpeg, keep=a.keep)
                 if handled:
                     print("waiting for scans again")
             except (requests.RequestException, ApiError) as exc:
