@@ -4,3 +4,5 @@ trimesh
 pillow
 pytest
 networkx
+requests
+fast-simplification
