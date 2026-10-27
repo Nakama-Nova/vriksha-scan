@@ -61,6 +61,7 @@ class Api:
     def __init__(self, base, worker, user=None, password=None):
         self.base, self.worker, self.user, self.password = base.rstrip("/"), worker, user, password
         self.token = None
+        self.role = None
 
     def login(self):
         r = http.post(f"{self.base}/auth/login", data={"username": self.user, "password": self.password}, timeout=30)
@@ -70,6 +71,7 @@ class Api:
                 reason += ". The account must exist in the desktop app under Staff (role Artisan or Owner) and the password must match"
             raise ApiError(r.status_code, f"Sign-in failed: {reason or 'the server refused it'}")
         self.token = r.json()["access_token"]
+        self.role = r.json().get("role")
 
     def _call(self, method, path, retry=True, **kw):
         if not self.token:
@@ -336,15 +338,24 @@ def main(argv=None):
     except (ApiError, requests.RequestException) as exc:
         print(f"Could not sign in to {a.url}: {exc}")
         return 1
-    print(f"signed in to {a.url} as {a.user}; worker '{a.worker}'")
-    while True:
-        try:
-            run_once(api, a.work_dir, colmap=a.colmap, ffmpeg=a.ffmpeg, keep=a.keep)
-        except (requests.RequestException, ApiError) as exc:
-            print(f"server not reachable or refused: {exc}")  # keep going: it may be a blip
-        if a.once:
-            return 0
-        time.sleep(POLL_SECONDS)
+    print(f"signed in to {a.url} as {a.user} ({api.role}); worker '{a.worker}'")
+    if api.role == "manager":
+        print("note: a manager can only process product scans. Temple restoration scans need an owner or artisan account.")
+    print(f"waiting for scans, checking every {POLL_SECONDS} s. Press Ctrl+C to stop.")
+    try:
+        while True:
+            try:
+                handled = run_once(api, a.work_dir, colmap=a.colmap, ffmpeg=a.ffmpeg, keep=a.keep)
+                if handled:
+                    print("waiting for scans again")
+            except (requests.RequestException, ApiError) as exc:
+                print(f"server not reachable or refused: {exc}")  # keep going: it may be a blip
+            if a.once:
+                return 0
+            time.sleep(POLL_SECONDS)
+    except KeyboardInterrupt:
+        print("stopped")
+        return 0
 
 
 if __name__ == "__main__":

@@ -206,6 +206,38 @@ def test_a_failed_sign_in_says_why_and_never_prints_a_traceback(monkeypatch, cap
     assert "Could not sign in" in out and expect in out and "Traceback" not in out
 
 
+def signed_in_http(role, queue=()):
+    class H:
+        def post(self, url, **kw):
+            return FakeResp(200, body={"access_token": "t", "role": role})
+
+        def request(self, method, url, **kw):
+            return FakeResp(200, body=list(queue))
+
+    return H()
+
+
+def test_ctrl_c_stops_quietly_and_a_manager_is_told_about_restorations(monkeypatch, capsys):
+    monkeypatch.setattr(w, "http", signed_in_http("manager"))
+    monkeypatch.setenv("VRIKSHA_PASSWORD", "x")
+
+    def interrupt(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(w.time, "sleep", interrupt)
+    assert w.main(["--url", "https://x", "--user", "supriya"]) == 0
+    out = capsys.readouterr().out
+    assert "waiting for scans" in out and "stopped" in out and "Traceback" not in out
+    assert "(manager)" in out and "restoration scans need an owner or artisan" in out
+
+
+def test_an_artisan_gets_no_manager_warning(monkeypatch, capsys):
+    monkeypatch.setattr(w, "http", signed_in_http("artisan"))
+    monkeypatch.setenv("VRIKSHA_PASSWORD", "x")
+    assert w.main(["--url", "https://x", "--user", "carver", "--once"]) == 0
+    assert "only process product scans" not in capsys.readouterr().out
+
+
 # ------------------------------------------------------------------ the job
 def scan(sid="aaaa1111", **params):
     return {"id": sid, "restoration_id": "r1", "item_id": None, "params": params}
