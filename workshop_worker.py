@@ -46,18 +46,32 @@ class ApiError(Exception):
         self.status = status
 
 
+def _detail(r):
+    """The server's own reason for an error, in words."""
+    try:
+        d = r.json()["detail"]
+        return d if isinstance(d, str) else d.get("message", str(d))
+    except (ValueError, KeyError, AttributeError, TypeError):
+        return (getattr(r, "text", "") or "")[:200]
+
+
 class Api:
     """The few server calls the worker needs. Signs in again by itself when the token expires."""
 
     def __init__(self, base, worker, user=None, password=None):
         self.base, self.worker, self.user, self.password = base.rstrip("/"), worker, user, password
         self.token = None
+        self.role = None
 
     def login(self):
         r = http.post(f"{self.base}/auth/login", data={"username": self.user, "password": self.password}, timeout=30)
         if r.status_code != 200:
-            raise ApiError(r.status_code, "Sign-in failed: check the user name and password")
+            reason = _detail(r)
+            if r.status_code == 401 and reason == "Invalid credentials":
+                reason += ". The account must exist in the desktop app under Staff (role Artisan or Owner) and the password must match"
+            raise ApiError(r.status_code, f"Sign-in failed: {reason or 'the server refused it'}")
         self.token = r.json()["access_token"]
+        self.role = r.json().get("role")
 
     def _call(self, method, path, retry=True, **kw):
         if not self.token:
@@ -67,12 +81,7 @@ class Api:
             self.token = None
             return self._call(method, path, retry=False, **kw)
         if r.status_code >= 400:
-            try:
-                detail = r.json()["detail"]
-                detail = detail if isinstance(detail, str) else detail.get("message", str(detail))
-            except (ValueError, KeyError, AttributeError):
-                detail = r.text[:200]
-            raise ApiError(r.status_code, detail)
+            raise ApiError(r.status_code, _detail(r))
         return r.json()
 
     def queue(self):
@@ -293,6 +302,16 @@ def process(api, scan, work, colmap="colmap", ffmpeg="ffmpeg", reconstruct=None,
             shutil.rmtree(folder, ignore_errors=True)
 
 
+def missing_tool(scan, colmap="colmap", ffmpeg="ffmpeg"):
+    """Why this PC cannot run the scan yet, or None. Checked BEFORE claiming, because a scan
+    that fails here is finished for good and the artisan would have to upload again."""
+    if not shutil.which(colmap):
+        return f"COLMAP was not found ('{colmap}'). Install it or pass --colmap with its full path"
+    if scan.get("source_kind") == "video" and not shutil.which(ffmpeg):
+        return f"ffmpeg was not found ('{ffmpeg}'), which video scans need"
+    return None
+
+
 def run_once(api, work, log=print, **kw):
     """Process every waiting scan, oldest first. Returns how many were handled."""
     handled = 0
@@ -300,6 +319,11 @@ def run_once(api, work, log=print, **kw):
         if not scan.get("restoration_id") and not scan.get("item_id"):
             log(f"skip {scan['id'][:8]}: not attached to a product or a restoration")
             continue
+        if kw.get("reconstruct") is None:  # tests inject their own reconstruction
+            problem = missing_tool(scan, kw.get("colmap", "colmap"), kw.get("ffmpeg", "ffmpeg"))
+            if problem:
+                log(f"left {scan['id'][:8]} waiting: {problem}")
+                continue
         try:
             outcome = process(api, scan, work, **kw)
         except ApiError as exc:
@@ -324,16 +348,31 @@ def main(argv=None):
     if not a.url or not a.user:
         p.error("--url and --user are needed (or VRIKSHA_URL and VRIKSHA_USER)")
     api = Api(a.url, a.worker, a.user, os.environ.get("VRIKSHA_PASSWORD") or getpass.getpass("Password: "))
-    api.login()
-    print(f"signed in to {a.url} as {a.user}; worker '{a.worker}'")
-    while True:
-        try:
-            run_once(api, a.work_dir, colmap=a.colmap, ffmpeg=a.ffmpeg, keep=a.keep)
-        except (requests.RequestException, ApiError) as exc:
-            print(f"server not reachable or refused: {exc}")  # keep going: it may be a blip
-        if a.once:
-            return 0
-        time.sleep(POLL_SECONDS)
+    try:
+        api.login()
+    except (ApiError, requests.RequestException) as exc:
+        print(f"Could not sign in to {a.url}: {exc}")
+        return 1
+    print(f"signed in to {a.url} as {a.user} ({api.role}); worker '{a.worker}'")
+    if api.role == "manager":
+        print("note: a manager can only process product scans. Temple restoration scans need an owner or artisan account.")
+    if not shutil.which(a.colmap):
+        print(f"warning: COLMAP was not found ('{a.colmap}'). Scans will wait until it is installed; pass --colmap with its full path.")
+    print(f"waiting for scans, checking every {POLL_SECONDS} s. Press Ctrl+C to stop.")
+    try:
+        while True:
+            try:
+                handled = run_once(api, a.work_dir, colmap=a.colmap, ffmpeg=a.ffmpeg, keep=a.keep)
+                if handled:
+                    print("waiting for scans again")
+            except (requests.RequestException, ApiError) as exc:
+                print(f"server not reachable or refused: {exc}")  # keep going: it may be a blip
+            if a.once:
+                return 0
+            time.sleep(POLL_SECONDS)
+    except KeyboardInterrupt:
+        print("stopped")
+        return 0
 
 
 if __name__ == "__main__":

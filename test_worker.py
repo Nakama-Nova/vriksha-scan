@@ -186,6 +186,73 @@ def test_the_api_signs_in_again_when_the_token_expires(monkeypatch):
     assert seen == ["login", "Bearer t1", "login", "Bearer t3"]
 
 
+@pytest.mark.parametrize(
+    "status,body,expect",
+    [
+        (401, {"detail": "Invalid credentials"}, "must exist in the desktop app under Staff"),
+        (401, {"detail": "This account is switched off. Ask the owner."}, "switched off"),
+        (429, {"detail": "Too many failed sign-in attempts. Try again in 15 minutes."}, "Too many failed"),
+    ],
+)
+def test_a_failed_sign_in_says_why_and_never_prints_a_traceback(monkeypatch, capsys, status, body, expect):
+    class H:
+        def post(self, url, **kw):
+            return FakeResp(status, body=body)
+
+    monkeypatch.setattr(w, "http", H())
+    monkeypatch.setenv("VRIKSHA_PASSWORD", "x")
+    assert w.main(["--url", "https://x", "--user", "workshop-pc", "--once"]) == 1
+    out = capsys.readouterr().out
+    assert "Could not sign in" in out and expect in out and "Traceback" not in out
+
+
+def signed_in_http(role, queue=()):
+    class H:
+        def post(self, url, **kw):
+            return FakeResp(200, body={"access_token": "t", "role": role})
+
+        def request(self, method, url, **kw):
+            return FakeResp(200, body=list(queue))
+
+    return H()
+
+
+def test_ctrl_c_stops_quietly_and_a_manager_is_told_about_restorations(monkeypatch, capsys):
+    monkeypatch.setattr(w, "http", signed_in_http("manager"))
+    monkeypatch.setenv("VRIKSHA_PASSWORD", "x")
+
+    def interrupt(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(w.time, "sleep", interrupt)
+    assert w.main(["--url", "https://x", "--user", "supriya"]) == 0
+    out = capsys.readouterr().out
+    assert "waiting for scans" in out and "stopped" in out and "Traceback" not in out
+    assert "(manager)" in out and "restoration scans need an owner or artisan" in out
+
+
+def test_an_artisan_gets_no_manager_warning(monkeypatch, capsys):
+    monkeypatch.setattr(w, "http", signed_in_http("artisan"))
+    monkeypatch.setenv("VRIKSHA_PASSWORD", "x")
+    assert w.main(["--url", "https://x", "--user", "carver", "--once"]) == 0
+    assert "only process product scans" not in capsys.readouterr().out
+
+
+def test_a_missing_tool_leaves_the_scan_waiting_instead_of_failing_it(tmp_path, fake_http):
+    api = FakeApi(scans=[scan("needs001")])
+    logs = []
+    handled = w.run_once(api, tmp_path, log=logs.append, colmap="no-such-colmap-anywhere")
+    assert handled == 0 and api.calls == []  # never claimed, so never failed
+    assert any("left needs001 waiting" in line and "COLMAP was not found" in line for line in logs)
+
+
+def test_video_scans_also_wait_for_ffmpeg(tmp_path, fake_http):
+    video = {**scan("vid00001"), "source_kind": "video"}
+    assert w.missing_tool(video, colmap=sys.executable, ffmpeg="no-such-ffmpeg") and "ffmpeg" in w.missing_tool(video, sys.executable, "no-such-ffmpeg")
+    assert w.missing_tool({**video, "source_kind": "photos"}, colmap=sys.executable, ffmpeg="no-such-ffmpeg") is None
+    assert w.missing_tool(video, colmap=sys.executable, ffmpeg=sys.executable) is None
+
+
 # ------------------------------------------------------------------ the job
 def scan(sid="aaaa1111", **params):
     return {"id": sid, "restoration_id": "r1", "item_id": None, "params": params}

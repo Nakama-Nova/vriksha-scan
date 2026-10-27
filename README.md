@@ -36,10 +36,16 @@ Restoration scans end up as private files on the restoration project (owner and 
 
 ```bash
 pip install -r requirements.txt
-set VRIKSHA_PASSWORD=...            # or it asks; never put it in a file
 python workshop_worker.py --url https://your-server --user workshop-pc          # keeps running, checks every 30 s
 python workshop_worker.py --url https://your-server --user workshop-pc --once   # one pass, then stops
 ```
+
+First create the sign-in in the desktop app: Staff, Add staff, role **Artisan (restoration)** (or use the
+owner). A manager cannot run restoration scans. The worker asks for the password when it starts; just type
+it there (nothing shows as you type). Do not paste it into chat or a file. If you prefer an environment
+variable, the syntax depends on the shell: `set VRIKSHA_PASSWORD=...` in cmd, `$env:VRIKSHA_PASSWORD='...'` in
+PowerShell, `export VRIKSHA_PASSWORD='...'` in Git Bash (single quotes: a `!` in double quotes or unquoted
+is expanded by bash history).
 
 Needs on the PC: **COLMAP** with CUDA (the dense step needs an NVIDIA GPU) and, for video scans,
 **ffmpeg**, on PATH or passed with `--colmap` / `--ffmpeg`. The worker calls
