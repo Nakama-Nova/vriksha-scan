@@ -186,6 +186,26 @@ def test_the_api_signs_in_again_when_the_token_expires(monkeypatch):
     assert seen == ["login", "Bearer t1", "login", "Bearer t3"]
 
 
+@pytest.mark.parametrize(
+    "status,body,expect",
+    [
+        (401, {"detail": "Invalid credentials"}, "must exist in the desktop app under Staff"),
+        (401, {"detail": "This account is switched off. Ask the owner."}, "switched off"),
+        (429, {"detail": "Too many failed sign-in attempts. Try again in 15 minutes."}, "Too many failed"),
+    ],
+)
+def test_a_failed_sign_in_says_why_and_never_prints_a_traceback(monkeypatch, capsys, status, body, expect):
+    class H:
+        def post(self, url, **kw):
+            return FakeResp(status, body=body)
+
+    monkeypatch.setattr(w, "http", H())
+    monkeypatch.setenv("VRIKSHA_PASSWORD", "x")
+    assert w.main(["--url", "https://x", "--user", "workshop-pc", "--once"]) == 1
+    out = capsys.readouterr().out
+    assert "Could not sign in" in out and expect in out and "Traceback" not in out
+
+
 # ------------------------------------------------------------------ the job
 def scan(sid="aaaa1111", **params):
     return {"id": sid, "restoration_id": "r1", "item_id": None, "params": params}
