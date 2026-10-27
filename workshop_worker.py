@@ -302,6 +302,16 @@ def process(api, scan, work, colmap="colmap", ffmpeg="ffmpeg", reconstruct=None,
             shutil.rmtree(folder, ignore_errors=True)
 
 
+def missing_tool(scan, colmap="colmap", ffmpeg="ffmpeg"):
+    """Why this PC cannot run the scan yet, or None. Checked BEFORE claiming, because a scan
+    that fails here is finished for good and the artisan would have to upload again."""
+    if not shutil.which(colmap):
+        return f"COLMAP was not found ('{colmap}'). Install it or pass --colmap with its full path"
+    if scan.get("source_kind") == "video" and not shutil.which(ffmpeg):
+        return f"ffmpeg was not found ('{ffmpeg}'), which video scans need"
+    return None
+
+
 def run_once(api, work, log=print, **kw):
     """Process every waiting scan, oldest first. Returns how many were handled."""
     handled = 0
@@ -309,6 +319,11 @@ def run_once(api, work, log=print, **kw):
         if not scan.get("restoration_id") and not scan.get("item_id"):
             log(f"skip {scan['id'][:8]}: not attached to a product or a restoration")
             continue
+        if kw.get("reconstruct") is None:  # tests inject their own reconstruction
+            problem = missing_tool(scan, kw.get("colmap", "colmap"), kw.get("ffmpeg", "ffmpeg"))
+            if problem:
+                log(f"left {scan['id'][:8]} waiting: {problem}")
+                continue
         try:
             outcome = process(api, scan, work, **kw)
         except ApiError as exc:
@@ -341,6 +356,8 @@ def main(argv=None):
     print(f"signed in to {a.url} as {a.user} ({api.role}); worker '{a.worker}'")
     if api.role == "manager":
         print("note: a manager can only process product scans. Temple restoration scans need an owner or artisan account.")
+    if not shutil.which(a.colmap):
+        print(f"warning: COLMAP was not found ('{a.colmap}'). Scans will wait until it is installed; pass --colmap with its full path.")
     print(f"waiting for scans, checking every {POLL_SECONDS} s. Press Ctrl+C to stop.")
     try:
         while True:

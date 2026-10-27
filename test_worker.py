@@ -238,6 +238,21 @@ def test_an_artisan_gets_no_manager_warning(monkeypatch, capsys):
     assert "only process product scans" not in capsys.readouterr().out
 
 
+def test_a_missing_tool_leaves_the_scan_waiting_instead_of_failing_it(tmp_path, fake_http):
+    api = FakeApi(scans=[scan("needs001")])
+    logs = []
+    handled = w.run_once(api, tmp_path, log=logs.append, colmap="no-such-colmap-anywhere")
+    assert handled == 0 and api.calls == []  # never claimed, so never failed
+    assert any("left needs001 waiting" in line and "COLMAP was not found" in line for line in logs)
+
+
+def test_video_scans_also_wait_for_ffmpeg(tmp_path, fake_http):
+    video = {**scan("vid00001"), "source_kind": "video"}
+    assert w.missing_tool(video, colmap=sys.executable, ffmpeg="no-such-ffmpeg") and "ffmpeg" in w.missing_tool(video, sys.executable, "no-such-ffmpeg")
+    assert w.missing_tool({**video, "source_kind": "photos"}, colmap=sys.executable, ffmpeg="no-such-ffmpeg") is None
+    assert w.missing_tool(video, colmap=sys.executable, ffmpeg=sys.executable) is None
+
+
 # ------------------------------------------------------------------ the job
 def scan(sid="aaaa1111", **params):
     return {"id": sid, "restoration_id": "r1", "item_id": None, "params": params}
