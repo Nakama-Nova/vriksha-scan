@@ -9,12 +9,17 @@ import functools
 
 import numpy as np
 import trimesh
-from PIL import Image
+from PIL import Image, ImageOps
+from scipy import ndimage as ndi
 
 MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
-PHOTO_SIDE = 1024  # the depth model is run at this size; bigger only costs time
+PHOTO_SIDE = 2048  # the photo is read at this size; the model only sees ~518 px at a time, so tiles carry the fine detail
+TILE = 640  # side of one photo tile fed to the model (it is shown at about its native pixels, so nothing is blurred away)
+TILE_OVERLAP = 0.5  # share of a tile shared with its neighbour; the overlap is blended so no seams show
+DETAIL_GAIN = 0.15  # how strongly the photo's own fine shading (grooves, ridges, strands) is cut into the depth; 0 = model only
+DETAIL_SIGMA = 3.0  # pixels: shading finer than this counts as detail, anything broader is left to the depth model
 DEPTH_SIDE = 2048  # largest depth map kept (G-code resamples it to the cutter's resolution anyway)
-MESH_SIDE = 256  # relief mesh grid: about 65,000 vertices, small enough for the server
+MESH_SIDE = 1024  # relief mesh grid: about 780,000 vertices; export_models simplifies it if a file is too big for the server
 RELIEF_DEPTH_MM = 15.0  # how deep the carving is cut, nearest to farthest
 FLOOR = 0.25  # depth below this share is treated as flat background (same default as vriksha.py)
 PHOTO_TYPES = {".jpg", ".jpeg", ".png"}
@@ -50,16 +55,67 @@ def _depth_pipeline():
     return pipeline("depth-estimation", model=MODEL)
 
 
-def estimate_depth(photo) -> np.ndarray:
-    """One photo -> relative depth, 0 (far) to 1 (nearest), same height/width as the (shrunk) photo."""
+def _model_depth(img) -> np.ndarray:
+    """The model's raw depth for one image, resized back to the image's own size."""
     import torch
 
-    img = Image.open(photo).convert("RGB")
-    img.thumbnail((PHOTO_SIDE, PHOTO_SIDE))
     d = _depth_pipeline()(img)["predicted_depth"]
-    d = torch.nn.functional.interpolate(d.reshape(1, 1, *d.shape[-2:]), size=img.size[::-1], mode="bicubic")[0, 0].numpy()
-    span = float(np.ptp(d))
-    return ((d - d.min()) / span if span > 0 else np.zeros_like(d)).astype(np.float32)
+    return torch.nn.functional.interpolate(d.reshape(1, 1, *d.shape[-2:]), size=img.size[::-1], mode="bicubic")[0, 0].numpy()
+
+
+def _starts(n, size, step):
+    """Tile start positions that cover 0..n with the last tile flush against the edge."""
+    if n <= size:
+        return [0]
+    return sorted({*range(0, n - size, step), n - size})
+
+
+def estimate_depth(photo) -> np.ndarray:
+    """One photo -> relative depth, 0 (far) to 1 (nearest), same height/width as the (shrunk) photo.
+
+    The model shows the whole photo at about 518 px, which smooths away carved detail. So the photo is
+    also read tile by tile at its own resolution; each tile is fitted to the whole-photo depth (the
+    model's scale differs per tile) and the overlaps are blended. The whole-photo depth keeps the
+    overall shape, the tiles add the fine detail."""
+    img = ImageOps.exif_transpose(Image.open(photo)).convert("RGB")  # phone photos are stored sideways
+    img.thumbnail((PHOTO_SIDE, PHOTO_SIDE), Image.LANCZOS)
+    w, h = img.size
+    whole = _model_depth(img)
+    if max(w, h) <= TILE:
+        return _unit(whole)
+    step = max(1, int(TILE * (1 - TILE_OVERLAP)))
+    fine, weight = np.zeros_like(whole), np.zeros_like(whole)
+    ramp = np.hanning(TILE + 2)[1:-1].astype(np.float32)  # blend weight: 0 at a tile edge, 1 in its middle
+    for y in _starts(h, TILE, step):
+        for x in _starts(w, TILE, step):
+            th, tw = min(TILE, h - y), min(TILE, w - x)
+            tile = _model_depth(img.crop((x, y, x + tw, y + th)))
+            ref = whole[y : y + th, x : x + tw]
+            a, b = np.polyfit(tile.ravel()[::7], ref.ravel()[::7], 1)  # tile -> whole-photo scale
+            k = np.outer(ramp[:th], ramp[:tw]) + 1e-6
+            fine[y : y + th, x : x + tw] += (a * tile + b) * k
+            weight[y : y + th, x : x + tw] += k
+    fine /= weight
+    # shape from the whole photo, detail (the fine ripples) from the tiles
+    sigma = TILE / 8
+    return _unit(shade_detail(ndi.gaussian_filter(whole, sigma) + fine - ndi.gaussian_filter(fine, sigma), img))
+
+
+def shade_detail(depth, img, gain=DETAIL_GAIN) -> np.ndarray:
+    """Add the photo's fine light/dark detail to the depth. A depth model smooths away carved strands and
+    ridges, but a lit carving still shows them as shading: darker in the grooves, lighter on the ridges.
+    Only fine detail is added (broad lighting is removed), scaled to the depth's own 0..1 range.
+    Painted colour pattern on a flat surface would also show up, so keep the gain low for paintings."""
+    lum = np.asarray(img.convert("L"), dtype=np.float32)
+    fine = lum - ndi.gaussian_filter(lum, DETAIL_SIGMA)
+    top = np.percentile(np.abs(fine), 99)
+    return depth + gain * np.clip(fine / top, -1, 1) * float(np.ptp(depth)) if top > 0 else depth
+
+
+def _unit(d) -> np.ndarray:
+    """Stretch to 0..1. The top and bottom 0.1% are clipped first, so one stray speck cannot flatten the carving."""
+    lo, hi = np.percentile(d, [0.1, 99.9])
+    return (np.clip(d - lo, 0, None) / (hi - lo) if hi > lo else np.zeros_like(d)).clip(0, 1).astype(np.float32)
 
 
 def shrink(depth, side) -> np.ndarray:

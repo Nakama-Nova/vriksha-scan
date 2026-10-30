@@ -666,3 +666,14 @@ def test_the_autostart_script_uses_flags_the_worker_has(capsys):
         assert flag in script and flag in help_text
     assert "AtLogOn" in script and "RestartCount" in script and "MultipleInstances" in script
 
+
+
+def test_fine_shading_in_the_photo_is_added_to_the_depth_but_not_broad_light():
+    flat = np.full((60, 80), 0.5, dtype=np.float32)
+    flat[0, 0] = 1.0  # some depth range, so the gain has a scale
+    lum = np.tile(np.linspace(0, 255, 80), (60, 1))  # broad lighting only: nothing fine
+    lum[30, 40] = 255  # one bright speck on a ridge
+    out = relief.shade_detail(flat, Image.fromarray(lum.astype(np.uint8)), gain=0.2)
+    assert out[30, 40] - flat[30, 40] > 0.05  # the speck is raised
+    assert abs(out[30, 10] - flat[30, 10]) < 0.01  # the gentle gradient is left alone
+    assert np.array_equal(relief.shade_detail(flat, Image.new("L", (80, 60)), gain=0.2), flat)  # flat photo: no change
