@@ -6,15 +6,18 @@ photographed all the way around, use the full COLMAP route in workshop_worker.py
 """
 
 import functools
+import os
 
 import numpy as np
 import trimesh
 from PIL import Image
+from scipy.ndimage import gaussian_filter
 
-MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
-PHOTO_SIDE = 1024  # the depth model is run at this size; bigger only costs time
+MODEL = os.environ.get("VRIKSHA_DEPTH_MODEL", "depth-anything/Depth-Anything-V2-Small-hf")  # or a folder from train_depth.py
+PHOTO_SIDE = 1536  # photo size kept; the model itself reads ~518 px, so tiles (below) recover the fine detail
+TILES = 2  # the photo is also read as TILES x TILES overlapping crops, each seen at full model resolution
 DEPTH_SIDE = 2048  # largest depth map kept (G-code resamples it to the cutter's resolution anyway)
-MESH_SIDE = 256  # relief mesh grid: about 65,000 vertices, small enough for the server
+MESH_SIDE = 512  # relief mesh grid: about 260,000 vertices (the worker simplifies it if the server will not take that)
 RELIEF_DEPTH_MM = 15.0  # how deep the carving is cut, nearest to farthest
 FLOOR = 0.25  # depth below this share is treated as flat background (same default as vriksha.py)
 PHOTO_TYPES = {".jpg", ".jpeg", ".png"}
@@ -50,14 +53,44 @@ def _depth_pipeline():
     return pipeline("depth-estimation", model=MODEL)
 
 
-def estimate_depth(photo) -> np.ndarray:
-    """One photo -> relative depth, 0 (far) to 1 (nearest), same height/width as the (shrunk) photo."""
+def _predict(img) -> np.ndarray:
+    """The depth model on one image: relative depth, larger = nearer, same size as the image."""
     import torch
 
+    d = _depth_pipeline()(img)["predicted_depth"]
+    return torch.nn.functional.interpolate(d.reshape(1, 1, *d.shape[-2:]), size=img.size[::-1], mode="bicubic")[0, 0].numpy()
+
+
+def refine(img, predict, tiles=TILES, overlap=0.25) -> np.ndarray:
+    """Whole-photo depth plus fine detail from overlapping crops.
+
+    The model reads any input at about 518 px, so a whole photo loses small carved detail. Each crop is
+    read at that same size (so it is `tiles` times sharper); only its fine detail (crop minus its own blur)
+    is added, scaled to match the whole-photo depth, so the crops need no stitching of their own depth."""
+    base = predict(img).astype(np.float32)
+    w, h = img.size
+    tw, th = min(w, round(w / tiles * (1 + overlap))), min(h, round(h / tiles * (1 + overlap)))
+    sigma = min(w, h) / 256  # detail finer than the whole-photo pass can resolve
+    detail, weight = np.zeros_like(base), np.zeros_like(base)
+    for i in range(tiles):
+        for j in range(tiles):
+            x, y = (round(i * (w - tw) / (tiles - 1)), round(j * (h - th) / (tiles - 1))) if tiles > 1 else (0, 0)
+            t = predict(img.crop((x, y, x + tw, y + th))).astype(np.float32)
+            b = base[y:y + th, x:x + tw]
+            lo, lo_b = gaussian_filter(t, sigma), gaussian_filter(b, sigma)
+            var = float(np.var(lo))
+            gain = max(0.0, float(np.mean((lo - lo.mean()) * (lo_b - lo_b.mean()))) / var) if var > 0 else 0.0  # crop depth -> whole-photo depth scale
+            feather = np.outer(np.hanning(th + 2)[1:-1], np.hanning(tw + 2)[1:-1]).astype(np.float32)  # >0, fades at crop edges
+            detail[y:y + th, x:x + tw] += gain * (t - lo) * feather
+            weight[y:y + th, x:x + tw] += feather
+    return base + detail / np.maximum(weight, 1e-6)
+
+
+def estimate_depth(photo) -> np.ndarray:
+    """One photo -> relative depth, 0 (far) to 1 (nearest), same height/width as the (shrunk) photo."""
     img = Image.open(photo).convert("RGB")
     img.thumbnail((PHOTO_SIDE, PHOTO_SIDE))
-    d = _depth_pipeline()(img)["predicted_depth"]
-    d = torch.nn.functional.interpolate(d.reshape(1, 1, *d.shape[-2:]), size=img.size[::-1], mode="bicubic")[0, 0].numpy()
+    d = refine(img, _predict)
     span = float(np.ptp(d))
     return ((d - d.min()) / span if span > 0 else np.zeros_like(d)).astype(np.float32)
 
