@@ -1,6 +1,11 @@
 # Vriksha Studios — scan → CNC pipeline
 
-Temple relief scan (photogrammetry mesh) → 3-axis G-code. Python 3.10+.
+Temple relief scan (photogrammetry mesh) → 3-axis G-code. Python 3.10+ (CI runs 3.12, on Linux and Windows).
+
+This repository has two tools:
+
+- **`vriksha.py`**: the converter, mesh or depth image to G-code. Runs on its own.
+- **`workshop_worker.py`**: the workshop-PC worker. It takes scans that staff upload from the phone app ([vriksha-mobile](https://github.com/Nakama-Nova/vriksha-mobile)) to the shop server ([nakamadesk-backend](https://github.com/Nakama-Nova/nakamadesk-backend)), builds the 3D model and G-code, and uploads the result.
 
 ```bash
 python -m venv .venv && .venv/Scripts/pip install -r requirements.txt   # Windows; use .venv/bin on Linux/Mac
@@ -40,6 +45,8 @@ python workshop_worker.py --url https://your-server --user workshop-pc          
 python workshop_worker.py --url https://your-server --user workshop-pc --once   # one pass, then stops
 ```
 
+Other options: `--worker NAME` (a name for this PC, default `workshop-pc`), `--work-dir DIR` (scratch space, default a `vriksha-worker` folder in the system temp), `--keep` (keep each job's working files), `--colmap` / `--ffmpeg` (tool paths), `--mode auto|full|relief`. `--url` and `--user` can also come from the `VRIKSHA_URL` and `VRIKSHA_USER` environment variables.
+
 First create the sign-in in the desktop app: Staff, Add staff, role **Artisan (restoration)** (or use the
 owner). A manager cannot run restoration scans. The worker asks for the password when it starts; just type
 it there (nothing shows as you type). Do not paste it into chat or a file. If you prefer an environment
@@ -71,6 +78,10 @@ true shape matters.
 - A failed job reports why on the scan (for example "too few overlapping photos") so it can be retaken.
 - The worker renews its claim while COLMAP runs; if the PC dies, the server gives the job to another try (3 in all).
 - `pytest test_worker.py` runs the whole job with a fake server and a synthetic mesh (no GPU needed).
+
+## Tests and CI
+
+`python -m pytest` runs `test_vriksha.py` (the converter, on a synthetic dome) and `test_worker.py`. CI (`.github/workflows/ci.yml`) does the same on Linux and Windows, plus flake8 for syntax errors and undefined names only. COLMAP itself is not tested in CI.
 
 ## Licence
 
