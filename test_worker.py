@@ -454,3 +454,215 @@ def test_a_video_scan_is_cut_into_frames_first(tmp_path, fake_http, monkeypatch)
     api = FakeApi(photos=1, kind="video")
     assert w.process(api, scan(), tmp_path, reconstruct=fake_reconstruct) == "done"
     assert cut == ["0000.jpg"]  # the first downloaded file is the video
+
+
+# ---------------------------------------------------------------- running by itself (no one at the PC)
+class FakeKeyring:
+    def __init__(self, saved=None):
+        self.store = dict(saved or {})
+
+    def get_password(self, service, key):
+        return self.store.get((service, key))
+
+    def set_password(self, service, key, password):
+        self.store[(service, key)] = password
+
+    def delete_password(self, service, key):
+        del self.store[(service, key)]
+
+
+def use_keyring(monkeypatch, saved=None):
+    kr = FakeKeyring(saved)
+    monkeypatch.setattr(w, "_keyring", lambda: kr)
+    return kr
+
+
+def no_prompt(monkeypatch):
+    def prompt(*a, **k):
+        raise AssertionError("an unattended worker must never ask for a password")
+
+    monkeypatch.setattr(w.getpass, "getpass", prompt)
+
+
+def test_the_password_comes_from_the_environment_then_the_saved_one_then_a_prompt(monkeypatch):
+    key = ("vriksha-scan", "u@https://x")
+    use_keyring(monkeypatch, {key: "saved"})
+    monkeypatch.setenv("VRIKSHA_PASSWORD", "env")
+    assert w.get_password("https://x/", "u", unattended=True) == "env"
+    monkeypatch.delenv("VRIKSHA_PASSWORD")
+    assert w.get_password("https://x/", "u", unattended=True) == "saved"
+    use_keyring(monkeypatch)  # nothing saved
+    assert w.get_password("https://x", "u", unattended=True) is None  # never a prompt when unattended
+    monkeypatch.setattr(w.sys, "stdin", type("S", (), {"isatty": lambda self: True})())
+    monkeypatch.setattr(w.getpass, "getpass", lambda prompt: "typed")
+    assert w.get_password("https://x", "u") == "typed"
+    monkeypatch.setattr(w.sys, "stdin", None)  # pythonw has no console to ask on
+    assert w.get_password("https://x", "u") is None
+
+
+def test_unattended_with_no_password_says_what_to_do_and_stops(monkeypatch, capsys):
+    use_keyring(monkeypatch)
+    no_prompt(monkeypatch)
+    monkeypatch.delenv("VRIKSHA_PASSWORD", raising=False)
+    assert w.main(["--url", "https://x", "--user", "u", "--unattended"]) == 2
+    assert "--save-password" in capsys.readouterr().out
+
+
+def test_unattended_waits_for_the_network_at_start_and_then_runs(monkeypatch, capsys):
+    calls, sleeps = [], []
+
+    class H:
+        def post(self, url, **kw):
+            calls.append(1)
+            if len(calls) <= 2:
+                raise w.requests.ConnectionError("network is not up yet")
+            return FakeResp(200, body={"access_token": "t", "role": "artisan"})
+
+        def request(self, method, url, **kw):
+            return FakeResp(200, body=[])
+
+    monkeypatch.setattr(w, "http", H())
+    monkeypatch.setattr(w.time, "sleep", sleeps.append)
+    use_keyring(monkeypatch, {("vriksha-scan", "u@https://x"): "pw"})
+    assert w.main(["--url", "https://x", "--user", "u", "--unattended", "--once"]) == 0
+    assert sleeps == [60, 60] and len(calls) == 3
+    assert "signed in" in capsys.readouterr().out
+
+
+def test_a_wrong_password_is_never_retried_quickly(monkeypatch, capsys):
+    """5 failed sign-ins in 15 minutes lock the account on the server, for the desktop app too."""
+    posts, sleeps = [], []
+
+    class H:
+        def post(self, url, **kw):
+            posts.append(1)
+            return FakeResp(401, body={"detail": "Invalid credentials"})
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(w, "http", H())
+    monkeypatch.setattr(w.time, "sleep", sleep)
+    monkeypatch.setenv("VRIKSHA_PASSWORD", "wrong")
+    assert w.main(["--url", "https://x", "--user", "u", "--unattended"]) == 0
+    assert sleeps == [3600, 3600] and len(posts) == 2  # one try per hour, and Ctrl+C stops it
+    assert "stopped" in capsys.readouterr().out
+
+
+def test_a_password_changed_while_running_does_not_lock_the_account(monkeypatch, capsys):
+    posts, sleeps = [], []
+
+    class H:
+        def post(self, url, **kw):
+            posts.append(1)
+            if len(posts) == 1:
+                return FakeResp(200, body={"access_token": "t", "role": "artisan"})
+            return FakeResp(401, body={"detail": "Invalid credentials"})
+
+        def request(self, method, url, **kw):
+            return FakeResp(401)  # the token no longer works
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(w, "http", H())
+    monkeypatch.setattr(w.time, "sleep", sleep)
+    monkeypatch.setenv("VRIKSHA_PASSWORD", "old")
+    assert w.main(["--url", "https://x", "--user", "u"]) == 0
+    assert sleeps == [3600] and len(posts) == 2  # not one failed sign-in every 30 s
+    assert "sign-in refused" in capsys.readouterr().out
+
+
+def test_a_bug_in_one_pass_does_not_stop_a_worker_nobody_is_watching(monkeypatch, capsys):
+    polls, sleeps = [], []
+
+    class H:
+        def post(self, url, **kw):
+            return FakeResp(200, body={"access_token": "t", "role": "artisan"})
+
+        def request(self, method, url, **kw):
+            polls.append(1)
+            if len(polls) == 1:
+                raise ValueError("something unexpected")
+            return FakeResp(200, body=[])
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(w, "http", H())
+    monkeypatch.setattr(w.time, "sleep", sleep)
+    monkeypatch.setenv("VRIKSHA_PASSWORD", "x")
+    assert w.main(["--url", "https://x", "--user", "u", "--unattended"]) == 0
+    assert sleeps == [30, 30] and len(polls) == 2
+    assert "ValueError: something unexpected" in capsys.readouterr().err
+    # by hand with --once the error is still raised, as before
+    polls.clear()
+    with pytest.raises(ValueError):
+        w.main(["--url", "https://x", "--user", "u", "--once"])
+
+
+def test_everything_printed_also_goes_to_a_small_log_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(w.sys, "stdout", w.sys.stdout)  # put the real ones back afterwards
+    monkeypatch.setattr(w.sys, "stderr", w.sys.stderr)
+    log = tmp_path / "logs" / "worker.log"
+    w.start_log_file(str(log))
+    print("signed in as carver")
+    print("half a line", end="")
+    print(" and the rest")
+    w.sys.stderr.write("Traceback (most recent call last):\n")
+    for h in w.logging.getLogger("vriksha-worker").handlers:
+        h.flush()
+        h.close()
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert any(line.endswith("signed in as carver") and line[:4].isdigit() for line in lines)  # starts with the date
+    assert any(line.endswith("half a line and the rest") for line in lines)
+    assert any("Traceback" in line for line in lines)
+
+
+def test_save_password_checks_it_first_and_forget_removes_it(monkeypatch, capsys):
+    kr = use_keyring(monkeypatch)
+    monkeypatch.setattr(w.getpass, "getpass", lambda prompt: "right")
+    monkeypatch.setattr(w, "http", signed_in_http("artisan"))
+    assert w.main(["--url", "https://x/", "--user", "carver", "--save-password"]) == 0
+    assert kr.store == {("vriksha-scan", "carver@https://x"): "right"}
+    assert "right" not in capsys.readouterr().out  # the password is never printed
+    assert w.get_password("https://x", "carver", unattended=True) == "right"
+    assert w.main(["--url", "https://x", "--user", "carver", "--forget-password"]) == 0
+    assert kr.store == {}
+
+
+def test_a_wrong_password_is_not_saved(monkeypatch):
+    kr = use_keyring(monkeypatch)
+    monkeypatch.setattr(w.getpass, "getpass", lambda prompt: "wrong")
+
+    class H:
+        def post(self, url, **kw):
+            return FakeResp(401, body={"detail": "Invalid credentials"})
+
+    monkeypatch.setattr(w, "http", H())
+    assert w.main(["--url", "https://x", "--user", "carver", "--save-password"]) == 1
+    assert kr.store == {}
+
+
+def test_saving_needs_the_keyring_package(monkeypatch, capsys):
+    monkeypatch.setattr(w, "_keyring", lambda: None)
+    assert w.main(["--url", "https://x", "--user", "carver", "--save-password"]) == 1
+    assert "pip install keyring" in capsys.readouterr().out
+
+
+def test_the_autostart_script_uses_flags_the_worker_has(capsys):
+    from pathlib import Path
+
+    script = (Path(__file__).parent / "install-autostart.ps1").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit):
+        w.main(["--help"])
+    help_text = capsys.readouterr().out
+    for flag in ("--unattended", "--log-file", "--url", "--user", "--worker"):
+        assert flag in script and flag in help_text
+    assert "AtLogOn" in script and "RestartCount" in script and "MultipleInstances" in script
+
