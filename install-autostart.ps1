@@ -16,7 +16,7 @@
   Then run this script. It never asks for or stores a password.
 
 .PARAMETER Url      The server address, for example https://api.vrikshastudios.com
-.PARAMETER User     The owner or Artisan account the worker signs in as (use its own account, for example workshop-pc).
+.PARAMETER User     The account the worker signs in as, its own login (for example workshop-pc). Owner: processes every scan. Manager: product scans (furniture) only. Artisan: restoration and sculpture scans only.
 .PARAMETER Worker   A name for this PC (shown to the server). Default: workshop-pc
 .PARAMETER Python   The pythonw.exe to use. Default: .venv\Scripts\pythonw.exe next to this script.
 .PARAMETER Remove   Stop the worker and remove the scheduled task.
