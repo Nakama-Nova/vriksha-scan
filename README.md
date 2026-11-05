@@ -79,6 +79,25 @@ true shape matters.
 - The worker renews its claim while COLMAP runs; if the PC dies, the server gives the job to another try (3 in all).
 - `pytest test_worker.py` runs the whole job with a fake server and a synthetic mesh (no GPU needed).
 
+## Run it by itself (Windows)
+
+The worker has to run on a workshop PC: the full 3D route needs that PC's NVIDIA GPU and COLMAP, and flat carvings need a ~1 GB depth model, so it cannot run on Vercel (short-lived functions, no GPU). Instead make the PC start it for you:
+
+```powershell
+# once, in this folder
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt -r requirements-relief.txt   # drop the second file if flat carvings are not wanted
+.venv\Scripts\python workshop_worker.py --url https://api.vrikshastudios.com --user workshop-pc --save-password
+.\install-autostart.ps1 -Url https://api.vrikshastudios.com -User workshop-pc
+```
+
+- `--save-password` asks for the password (nothing shows as you type), signs in to check it, and keeps it in the **Windows Credential Manager** under your Windows user. It is never written to a file, a script or the scheduled task. A wrong password is not saved. `--forget-password` removes it.
+- `install-autostart.ps1` registers a scheduled task "Vriksha Scan Worker": it starts when this Windows user signs in, runs hidden, restarts a minute after a crash, and never runs two copies. `.\install-autostart.ps1 -Remove` undoes it; `-DryRun` shows what it would do.
+- **Which account decides what the worker may process** (the server checks this, not the worker): an **owner** account can process everything; a **manager** account only product scans (furniture and other products); an **artisan** account only restoration and sculpture scans. So a PC that should do furniture carvings needs an owner or manager account, and one for temple restorations an owner or artisan account. Give the worker its own login (for example `workshop-pc`), not a person's.
+- The log is `%LOCALAPPDATA%\VrikshaScan\worker.log` (about 1 MB, three older files kept). Status: `Get-ScheduledTask -TaskName 'Vriksha Scan Worker' | Get-ScheduledTaskInfo`.
+- Set the PC to sign in by itself after a restart and not to sleep while plugged in; while it is asleep or signed out, scans just wait.
+- `--unattended` (what the task uses) never asks for a password, keeps trying to sign in if the network is not up yet, and keeps going after an unexpected error. If the password was changed or the account is locked or switched off, it tries again only once an hour: the server locks an account after 5 failed sign-ins in 15 minutes, and that lock would also stop the same person using the desktop app. After changing the account's password, run `--save-password` again.
+
 ## Tests and CI
 
 `python -m pytest` runs `test_vriksha.py` (the converter, on a synthetic dome) and `test_worker.py`. CI (`.github/workflows/ci.yml`) does the same on Linux and Windows, plus flake8 for syntax errors and undefined names only. COLMAP itself is not tested in CI.

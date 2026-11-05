@@ -8,7 +8,9 @@ the job. The server only hands out signed links, so this PC holds no cloud keys.
     python workshop_worker.py --url https://your-server --user workshop-pc          # keeps running
     python workshop_worker.py --url https://your-server --user workshop-pc --once   # one pass, then stop
 
-The password comes from VRIKSHA_PASSWORD or a prompt. Needs COLMAP (with CUDA for the dense
+The password comes from VRIKSHA_PASSWORD, from the one saved with --save-password (Windows Credential
+Manager), or from a prompt. To run by itself when the PC starts, see install-autostart.ps1.
+Needs COLMAP (with CUDA for the dense
 step) and, for video scans, ffmpeg, both on PATH or given with --colmap / --ffmpeg.
 """
 
@@ -16,12 +18,15 @@ import argparse
 import collections
 import getpass
 import importlib.util
+import logging
+import logging.handlers
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 
 import requests
@@ -33,6 +38,12 @@ import vriksha
 http = requests  # replaced in tests
 
 POLL_SECONDS = 30
+NETWORK_RETRY_SECONDS = 60  # unattended: the PC may start before the network is up
+# After a refused sign-in, wait before trying again. The server locks an account after 5 failed
+# tries in 15 minutes (even if the next password is right), so a wrong or changed password must
+# never be retried every poll: that would also lock the same person out of the desktop app.
+SIGNIN_WAIT = {401: 3600, 403: 3600, 429: 900}
+KEYRING_SERVICE = "vriksha-scan"
 HEARTBEAT_SECONDS = 60  # the server gives a job 30 minutes; any progress call renews it
 MAX_FRAMES = 300
 MB = 1024 * 1024
@@ -57,6 +68,10 @@ def _detail(r):
         return (getattr(r, "text", "") or "")[:200]
 
 
+class SignInError(ApiError):
+    """The server refused the sign-in (wrong password, switched-off account, locked for a while)."""
+
+
 class Api:
     """The few server calls the worker needs. Signs in again by itself when the token expires."""
 
@@ -71,7 +86,7 @@ class Api:
             reason = _detail(r)
             if r.status_code == 401 and reason == "Invalid credentials":
                 reason += ". The account must exist in the desktop app under Staff (role Artisan or Owner) and the password must match"
-            raise ApiError(r.status_code, f"Sign-in failed: {reason or 'the server refused it'}")
+            raise SignInError(r.status_code, f"Sign-in failed: {reason or 'the server refused it'}")
         self.token = r.json()["access_token"]
         self.role = r.json().get("role")
 
@@ -384,6 +399,102 @@ def cannot_run(scan, caps):
     return caps["video"] if scan.get("source_kind") == "video" else None
 
 
+def _keyring():
+    try:
+        import keyring
+
+        return keyring
+    except Exception:  # not installed, or no backend on this system
+        return None
+
+
+def _key(url, user):
+    return f"{user}@{url.rstrip('/')}"
+
+
+def saved_password(url, user):
+    """The password saved with --save-password (Windows Credential Manager), or None."""
+    kr = _keyring()
+    try:
+        return kr.get_password(KEYRING_SERVICE, _key(url, user)) if kr else None
+    except Exception:
+        return None
+
+
+def get_password(url, user, unattended=False):
+    """VRIKSHA_PASSWORD, else the saved one, else a prompt (never a prompt when unattended)."""
+    password = os.environ.get("VRIKSHA_PASSWORD") or saved_password(url, user)
+    if password:
+        return password
+    if unattended or not (sys.stdin and sys.stdin.isatty()):
+        return None
+    return getpass.getpass("Password: ")
+
+
+class LogStream:
+    """Stands in for stdout/stderr: every line goes to the log file with the time, and to the console if there is one."""
+
+    def __init__(self, logger, console):
+        self.logger, self.console, self.pending = logger, console, ""
+
+    def write(self, text):
+        if self.console:
+            try:
+                self.console.write(text)
+            except Exception:
+                pass
+        *lines, self.pending = (self.pending + text).split("\n")
+        for line in lines:
+            if line.strip():
+                self.logger.info(line.rstrip())
+        return len(text)
+
+    def flush(self):
+        if self.console:
+            try:
+                self.console.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+
+def start_log_file(path):
+    """Keep what the worker prints in a log file (about 1 MB, 3 older files kept) so a PC nobody is watching can be checked."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(path, maxBytes=MB, backupCount=3, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    logger = logging.getLogger("vriksha-worker")
+    logger.setLevel(logging.INFO)
+    logger.handlers[:] = [handler]
+    logger.propagate = False
+    sys.stdout, sys.stderr = LogStream(logger, sys.stdout), LogStream(logger, sys.stderr)
+
+
+def sign_in(api, url, unattended, sleep=None):
+    """
+    The first sign-in. By hand: one try, so a typo is seen at once (False if it failed).
+    Unattended: keep trying until it works, slowly, since the network may not be up yet
+    and a wrong password must not be retried quickly (see SIGNIN_WAIT).
+    """
+    sleep = sleep or time.sleep
+    while True:
+        try:
+            api.login()
+            return True
+        except SignInError as exc:
+            print(f"Could not sign in to {url}: {exc}")
+            wait = SIGNIN_WAIT.get(exc.status, NETWORK_RETRY_SECONDS)
+        except (ApiError, requests.RequestException) as exc:
+            print(f"Could not sign in to {url}: {exc}")
+            wait = NETWORK_RETRY_SECONDS
+        if not unattended:
+            return False
+        print(f"trying again in {wait // 60} min")
+        sleep(wait)
+
+
 def run_once(api, work, log=print, caps=None, mode="auto", **kw):
     """Process every waiting scan this PC can build, oldest first. Returns how many were handled."""
     caps = caps or capabilities(kw.get("colmap", "colmap"), kw.get("ffmpeg", "ffmpeg"), mode)
@@ -406,6 +517,28 @@ def run_once(api, work, log=print, caps=None, mode="auto", **kw):
     return handled
 
 
+def manage_saved_password(a):
+    """--save-password / --forget-password: keep the password in the Windows Credential Manager."""
+    kr = _keyring()
+    if kr is None:
+        print("This needs the keyring package: pip install keyring")
+        return 1
+    key = _key(a.url, a.user)
+    if a.forget_password:
+        try:
+            kr.delete_password(KEYRING_SERVICE, key)
+            print("saved password removed")
+        except Exception:
+            print("there was no saved password")
+        return 0
+    password = getpass.getpass(f"Password for {a.user} (typed text is not shown): ")
+    if not sign_in(Api(a.url, a.worker, a.user, password), a.url, unattended=False):
+        return 1  # a wrong password is not saved
+    kr.set_password(KEYRING_SERVICE, key, password)
+    print(f"saved for {a.user} on {a.url}. The worker can now sign in by itself.")
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--url", default=os.environ.get("VRIKSHA_URL"), help="the server address")
@@ -417,15 +550,28 @@ def main(argv=None):
     p.add_argument("--mode", choices=["auto", "full", "relief"], default="auto", help="auto: build what this PC can; or force full 3D or flat carvings only")
     p.add_argument("--once", action="store_true", help="one pass over the queue, then stop")
     p.add_argument("--keep", action="store_true", help="keep each job's working files")
+    p.add_argument("--unattended", action="store_true", help="for a PC nobody watches: never ask for a password, keep trying to sign in, keep running after an error")
+    p.add_argument("--log-file", help="also write everything printed to this file (it is kept small)")
+    p.add_argument("--save-password", action="store_true", help="ask for the password once and keep it in the Windows Credential Manager, then stop")
+    p.add_argument("--forget-password", action="store_true", help="remove the saved password, then stop")
     a = p.parse_args(argv)
     if not a.url or not a.user:
         p.error("--url and --user are needed (or VRIKSHA_URL and VRIKSHA_USER)")
-    api = Api(a.url, a.worker, a.user, os.environ.get("VRIKSHA_PASSWORD") or getpass.getpass("Password: "))
+    if a.save_password or a.forget_password:
+        return manage_saved_password(a)
+    if a.log_file:
+        start_log_file(a.log_file)
+    password = get_password(a.url, a.user, a.unattended)
+    if not password:
+        print("No password. Run once with --save-password (or set VRIKSHA_PASSWORD), then start the worker again.")
+        return 2
+    api = Api(a.url, a.worker, a.user, password)
     try:
-        api.login()
-    except (ApiError, requests.RequestException) as exc:
-        print(f"Could not sign in to {a.url}: {exc}")
-        return 1
+        if not sign_in(api, a.url, a.unattended):
+            return 1
+    except KeyboardInterrupt:  # unattended sign-in waits and retries until it works
+        print("stopped")
+        return 0
     print(f"signed in to {a.url} as {a.user} ({api.role}); worker '{a.worker}'")
     if api.role == "manager":
         print("note: a manager can only process product scans. Temple restoration scans need an owner or artisan account.")
@@ -437,15 +583,23 @@ def main(argv=None):
     print(f"waiting for scans, checking every {POLL_SECONDS} s. Press Ctrl+C to stop.")
     try:
         while True:
+            wait = POLL_SECONDS
             try:
                 handled = run_once(api, a.work_dir, mode=a.mode, colmap=a.colmap, ffmpeg=a.ffmpeg, keep=a.keep)
                 if handled:
                     print("waiting for scans again")
+            except SignInError as exc:  # the password was changed, or the account is locked or switched off
+                wait = SIGNIN_WAIT.get(exc.status, POLL_SECONDS)
+                print(f"sign-in refused: {exc}. Not trying again for {wait // 60} min")
             except (requests.RequestException, ApiError) as exc:
                 print(f"server not reachable or refused: {exc}")  # keep going: it may be a blip
+            except Exception:
+                if a.once:
+                    raise
+                traceback.print_exc()  # a bug in one job must not stop a PC nobody is watching
             if a.once:
                 return 0
-            time.sleep(POLL_SECONDS)
+            time.sleep(wait)
     except KeyboardInterrupt:
         print("stopped")
         return 0
