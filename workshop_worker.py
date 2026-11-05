@@ -289,13 +289,21 @@ def relief_files(images, folder, params, progress, estimate=None):
     out = folder / "out"
     out.mkdir(parents=True, exist_ok=True)
     photo = relief.pick_front(sorted(Path(images).glob("*")))
+    crop, mask = params.get("crop"), None
+    if crop:  # one carved area marked on a photo: straighten it first (see relief.rectify_area)
+        progress.set(10, "Straightening the marked area")
+        straight, mask = relief.rectify_area(photo, crop, params.get("real_width_mm"))
+        photo = folder / "area.png"
+        straight.save(photo)
     progress.set(15, "Reading the carving's depth (a minute or two on a normal PC)")
     depth = relief.shrink((estimate or relief.estimate_depth)(photo), relief.DEPTH_SIDE)
+    if crop:
+        depth = relief.flatten(depth, mask)  # no slope from the slanted photo; outside the outline is background
     width = params.get("real_width_mm")
     progress.set(70, "Making the 3D files")
     files = export_models(relief.relief_mesh(depth, width or 100.0), out, "relief", mm=True)
     depth_png = relief.save_depth_png(depth, folder / "depth.png")
-    files.append((relief.save_preview_png(depth, out / "relief-depth.png"), "render"))
+    files.append((relief.save_preview_png(depth, out / "relief-depth.png", mask=mask), "render"))
     if params.get("gcode"):
         progress.set(85, "Making the CNC G-code")
         files += make_gcode_depth(depth_png, out, "relief", width)

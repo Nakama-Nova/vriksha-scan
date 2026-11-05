@@ -666,3 +666,153 @@ def test_the_autostart_script_uses_flags_the_worker_has(capsys):
         assert flag in script and flag in help_text
     assert "AtLogOn" in script and "RestartCount" in script and "MultipleInstances" in script
 
+
+
+def test_fine_shading_in_the_photo_is_added_to_the_depth_but_not_broad_light():
+    flat = np.full((60, 80), 0.5, dtype=np.float32)
+    flat[0, 0] = 1.0  # some depth range, so the gain has a scale
+    lum = np.tile(np.linspace(0, 255, 80), (60, 1))  # broad lighting only: nothing fine
+    lum[30, 40] = 255  # one bright speck on a ridge
+    out = relief.shade_detail(flat, Image.fromarray(lum.astype(np.uint8)), gain=0.2)
+    assert out[30, 40] - flat[30, 40] > 0.05  # the speck is raised
+    assert abs(out[30, 10] - flat[30, 10]) < 0.01  # the gentle gradient is left alone
+    assert np.array_equal(relief.shade_detail(flat, Image.new("L", (80, 60)), gain=0.2), flat)  # flat photo: no change
+
+
+# ---------------------------------------------------------------- a marked area of a photo
+def photo_with_corner_dots(path, quad, size=(600, 400)):
+    """A dark photo with a coloured dot on each corner of the marked area (red, green, blue, yellow)."""
+    img = Image.new("RGB", size, (20, 20, 20))
+    for (x, y), colour in zip(quad, [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)]):
+        img.paste(colour, (int(x) - 12, int(y) - 12, int(x) + 12, int(y) + 12))
+    img.save(path)
+    return img
+
+
+def test_a_slanted_area_is_straightened_so_each_corner_lands_in_its_corner(tmp_path):
+    quad = [[100, 60], [500, 100], [480, 330], [130, 300]]  # a headboard seen from an angle
+    photo_with_corner_dots(tmp_path / "p.png", quad)
+    straight, mask = relief.rectify_area(tmp_path / "p.png", {"quad": quad})
+    assert mask is None
+    a = np.asarray(straight).astype(int)
+    h, w = a.shape[:2]
+    for (cx, cy), channel in [((6, 6), 0), ((w - 7, 6), 1), ((w - 7, h - 7), 2), ((6, h - 7), None)]:
+        px = a[cy, cx]
+        if channel is None:
+            assert px[0] > 200 and px[1] > 200 and px[2] < 80  # yellow
+        else:
+            assert px[channel] > 200 and sum(px) - px[channel] < 120
+
+
+def test_an_upright_area_is_just_the_crop_enlarged(tmp_path):
+    rng = np.random.default_rng(1)
+    base = np.asarray(Image.fromarray(rng.integers(0, 255, (30, 40, 3), dtype=np.uint8)).resize((400, 300), Image.BICUBIC))
+    Image.fromarray(base).save(tmp_path / "p.png")
+    straight, _ = relief.rectify_area(tmp_path / "p.png", {"quad": [[50, 40], [250, 40], [250, 140], [50, 140]]})
+    small = np.asarray(straight.resize((200, 100), Image.BOX)).astype(int)
+    assert np.abs(small - base[40:140, 50:250].astype(int)).mean() < 8  # same picture, more pixels
+
+
+def test_the_straightened_size_follows_the_real_shape_and_small_areas_are_enlarged():
+    quad = [[0, 0], [300, 0], [300, 100], [0, 100]]
+    w1, h1 = relief.area_size(quad)
+    assert max(w1, h1) == relief.AREA_MIN_SIDE and abs(w1 / h1 - 3) < 0.01  # from the corners, enlarged
+    w2, h2 = relief.area_size(quad, real_w=900, real_h=450)
+    assert abs(w2 / h2 - 2) < 0.01  # the owner's measurements win
+    w3, h3 = relief.area_size([[0, 0], [4000, 0], [4000, 1000], [0, 1000]])
+    assert max(w3, h3) == relief.PHOTO_SIDE and abs(w3 / h3 - 4) < 0.01  # never beyond what the model takes
+    w4, h4 = relief.area_size([[0, 0], [100, 0], [100, 400], [0, 400]])
+    assert h4 == relief.AREA_MIN_SIDE and w4 < h4  # a tall area
+
+
+def test_the_outline_becomes_a_mask_in_the_straightened_picture(tmp_path):
+    Image.new("RGB", (400, 300), "white").save(tmp_path / "p.png")
+    quad = [[100, 50], [300, 50], [300, 150], [100, 150]]
+    outline = [[200, 55], [295, 145], [105, 145]]  # a triangle: point up
+    straight, mask = relief.rectify_area(tmp_path / "p.png", {"quad": quad, "outline": outline})
+    assert mask.shape == (straight.height, straight.width)
+    h, w = mask.shape
+    assert mask[int(h * 0.8), w // 2] and not mask[5, 5] and not mask[5, w - 5]  # inside the triangle, outside its corners
+
+
+def test_flatten_takes_out_a_slope_but_keeps_the_carving(tmp_path):
+    y, x = np.mgrid[0:120, 0:200]
+    carving = 0.1 * ((x // 10 + y // 10) % 2)  # a checker of ridges
+    slanted = (0.6 * x / 200 + carving).astype(np.float32)
+    out = relief.flatten(slanted)
+    assert abs(float(out[:, -60:].mean() - out[:, :60].mean())) < 0.05  # no slope left
+    assert np.corrcoef(out.ravel(), carving.ravel())[0, 1] > 0.9  # the ridges are what is left
+    assert out.min() >= 0 and out.max() <= 1
+
+
+def test_flatten_makes_everything_outside_the_outline_background():
+    d = np.random.default_rng(2).random((60, 80)).astype(np.float32)
+    mask = np.zeros((60, 80), dtype=bool)
+    mask[10:50, 20:60] = True
+    out = relief.flatten(d, mask)
+    assert (out[~mask] == 0).all() and out[mask].max() > 0.9
+    small = relief.flatten(d, np.asarray(Image.fromarray(mask.astype(np.uint8) * 255).resize((40, 30), Image.NEAREST)) > 127)
+    assert small.shape == d.shape  # a mask of another size is fitted to the depth
+
+
+def test_the_preview_keeps_the_shape_of_an_outlined_design(tmp_path):
+    d = np.full((20, 30), 0.5, dtype=np.float32)
+    mask = np.zeros((20, 30), dtype=bool)
+    mask[:, 10:20] = True
+    relief.save_preview_png(d, tmp_path / "plain.png")
+    relief.save_preview_png(d, tmp_path / "shaped.png", mask=mask)
+    assert Image.open(tmp_path / "plain.png").mode == "L"
+    shaped = Image.open(tmp_path / "shaped.png")
+    assert shaped.mode == "LA" and shaped.getpixel((15, 5))[1] == 255 and shaped.getpixel((2, 5))[1] == 0  # transparent outside
+
+
+class Quiet:
+    def set(self, percent, note):
+        pass
+
+
+def test_a_marked_area_is_straightened_before_the_depth_is_read_and_flattened_after(tmp_path, monkeypatch):
+    monkeypatch.setattr(relief, "AREA_MIN_SIDE", 120)  # keep the test small
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    photo_with_corner_dots(photos / "a.png", [[100, 60], [500, 100], [480, 330], [130, 300]])
+    seen = []
+
+    def estimate(path):
+        seen.append(Image.open(path).size)
+        y, x = np.mgrid[0:60, 0:90]
+        return (x / 90 + 0.2 * ((x // 6 + y // 6) % 2)).astype(np.float32)  # a slope plus ridges
+
+    crop = {"quad": [[100, 60], [500, 100], [480, 330], [130, 300]], "outline": [[150, 90], [450, 120], [300, 300]]}
+    files = w.relief_files(photos, tmp_path / "work", {"real_width_mm": 600, "gcode": False, "crop": crop}, Quiet(), estimate=estimate)
+    assert seen == [relief.area_size([tuple(p) for p in crop["quad"]])]  # the model read the straightened area, not the photo
+    kinds = [k for _, k in files]
+    assert kinds == ["glb", "stl", "obj", "ply", "render"]
+    picture = Image.open([p for p, k in files if k == "render"][0])
+    assert picture.mode == "LA" and picture.getpixel((0, 0))[1] == 0  # shaped like the outline
+    depth = np.asarray(Image.open(tmp_path / "work" / "depth.png")).astype(float) / 65535
+    assert abs(depth[:, -20:].mean() - depth[:, :20].mean()) < 0.2  # the slope the photo added is gone
+
+
+def test_without_a_marked_area_nothing_changes(tmp_path):
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    Image.fromarray(np.random.default_rng(4).integers(0, 255, (60, 80, 3), dtype=np.uint8)).save(photos / "a.jpg")
+    seen = []
+
+    def estimate(path):
+        seen.append(Image.open(path).size)
+        return gradient_depth(path)
+
+    files = w.relief_files(photos, tmp_path / "work", {"real_width_mm": 40}, Quiet(), estimate=estimate)
+    assert seen == [(80, 60)] and Image.open([p for p, k in files if k == "render"][0]).mode == "L"
+
+
+def test_a_whole_job_for_a_marked_area_finishes(tmp_path, fake_http):
+    api = FakeApi(photos=1)
+    crop = {"quad": [[10, 8], [70, 8], [70, 52], [10, 52]], "outline": [[12, 10], [68, 10], [40, 50]]}
+    params = {"shape": "relief", "real_width_mm": 600, "gcode": False, "label": "Headboard lotus", "crop": crop}
+    out = w.process(api, {**scan(), "params": params}, tmp_path, estimate=gradient_depth)
+    assert out == "done" and api.failed is None
+    assert [a["kind"] for a in api.assets] == ["glb", "stl", "obj", "ply", "render"]
+
