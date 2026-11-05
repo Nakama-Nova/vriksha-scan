@@ -73,6 +73,14 @@ The flat-carving depth is a model's guess: relative, front face only, no undercu
 real width entered on the scan (without one the model is marked "size not set"). Use the full route when the
 true shape matters.
 
+**A marked area of a photo.** A flat-carving scan can carry `params.crop`: four corners (clockwise from the
+top-left) and, optionally, an outline, marked on one photo in the Lab editor. The worker straightens the four
+corners into a rectangle (so a slanted shot of a headboard reads like a straight-on one), enlarges small areas to
+at least 1500 px (the depth model reads a repeating pattern such as a tufted lattice as a blur when it is small),
+reads the depth, takes out the slope the slanted photo adds, and, with an outline, makes everything outside it
+background and transparent in the picture, so a shaped crown keeps its shape. The shape of the area comes from the
+real width and height entered, else from the corners. Check the depth in millimetres on scrap before cutting.
+
 - The widest side of the model is set to the real width entered on the scan (mm). G-code needs that width.
 - A model larger than the server accepts is simplified, the same way for every format, until each file fits.
 - A failed job reports why on the scan (for example "too few overlapping photos") so it can be retaken.

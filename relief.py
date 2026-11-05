@@ -9,7 +9,7 @@ import functools
 
 import numpy as np
 import trimesh
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageOps
 from scipy import ndimage as ndi
 
 MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
@@ -118,6 +118,84 @@ def _unit(d) -> np.ndarray:
     return (np.clip(d - lo, 0, None) / (hi - lo) if hi > lo else np.zeros_like(d)).clip(0, 1).astype(np.float32)
 
 
+# ---------------------------------------------------------------- a marked area of a photo
+# The depth model reads a close-up of a repeating pattern (a tufted lattice) far better when it is enlarged:
+# a 600 px area came out as a blur, the same area at 1500+ px shows every button. So small areas are enlarged.
+AREA_MIN_SIDE = 1500
+# The owner marks one carved area on a photo (four corners, and optionally an outline). It is
+# straightened into a flat rectangle, so a slanted photo of a headboard reads like a straight-on one.
+def _homography(src, dst) -> np.ndarray:
+    """The 8 numbers of the perspective map that takes the four `src` points to the four `dst` points."""
+    rows, rhs = [], []
+    for (x, y), (u, v) in zip(src, dst):
+        rows.append([x, y, 1, 0, 0, 0, -u * x, -u * y])
+        rhs.append(u)
+        rows.append([0, 0, 0, x, y, 1, -v * x, -v * y])
+        rhs.append(v)
+    return np.linalg.solve(np.array(rows, dtype=float), np.array(rhs, dtype=float))
+
+
+def _apply(h, x, y):
+    d = h[6] * x + h[7] * y + 1
+    return (h[0] * x + h[1] * y + h[2]) / d, (h[3] * x + h[4] * y + h[5]) / d
+
+
+def _dist(a, b) -> float:
+    return float(np.hypot(a[0] - b[0], a[1] - b[1]))
+
+
+def area_size(quad, real_w=None, real_h=None, side=PHOTO_SIDE):
+    """(width, height) in pixels of the straightened area: the shape the owner gave (real width and
+    height), else the shape of the marked corners. A small area is enlarged to AREA_MIN_SIDE."""
+    w_px = (_dist(quad[0], quad[1]) + _dist(quad[3], quad[2])) / 2
+    h_px = (_dist(quad[0], quad[3]) + _dist(quad[1], quad[2])) / 2
+    aspect = real_w / real_h if real_w and real_h else w_px / h_px
+    longest = min(float(side), max(float(AREA_MIN_SIDE), w_px, h_px))  # small areas are enlarged, see AREA_MIN_SIDE
+    if aspect >= 1:
+        return round(longest), max(2, round(longest / aspect))
+    return max(2, round(longest * aspect)), round(longest)
+
+
+def rectify_area(photo, crop, real_width_mm=None):
+    """Photo + marked area -> (the area straightened to a rectangle, mask of the outline or None).
+    `crop` is {"quad": 4 corners clockwise from the top-left, "outline": points or None, "real_height_mm": ...},
+    all in the pixels of the photo as it looks on screen (the phone's sideways turn is undone first)."""
+    img = ImageOps.exif_transpose(Image.open(photo)).convert("RGB")
+    quad = [(float(x), float(y)) for x, y in crop["quad"]]
+    w, h = area_size(quad, real_width_mm, crop.get("real_height_mm"))
+    corners = [(0, 0), (w, 0), (w, h), (0, h)]
+    straight = img.transform((w, h), Image.PERSPECTIVE, tuple(_homography(corners, quad)), Image.BICUBIC)
+    mask = None
+    if crop.get("outline"):
+        forward = _homography(quad, corners)
+        shape = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(shape).polygon([_apply(forward, float(x), float(y)) for x, y in crop["outline"]], fill=255)
+        mask = np.asarray(shape) > 127
+    return straight, mask
+
+
+def flatten(depth, mask=None) -> np.ndarray:
+    """Take out the overall slope a slanted photo adds (a flat panel should read flat), stretch what is
+    left to 0..1 over the carving, and make everything outside `mask` background (0)."""
+    h, w = depth.shape
+    if mask is not None and mask.shape != depth.shape:
+        mask = np.asarray(Image.fromarray(mask.astype(np.uint8) * 255).resize((w, h), Image.NEAREST)) > 127
+    ys, xs = np.mgrid[0:h:4, 0:w:4]  # every 4th pixel is plenty to find a plane
+    sel = mask[::4, ::4] if mask is not None else np.ones(xs.shape, dtype=bool)
+    if sel.sum() < 16:
+        sel = np.ones(xs.shape, dtype=bool)
+    plane_in = np.column_stack([xs[sel] / w, ys[sel] / h, np.ones(int(sel.sum()))])
+    coef = np.linalg.lstsq(plane_in, depth[::4, ::4][sel], rcond=None)[0]
+    yy, xx = np.mgrid[0:h, 0:w]
+    flat = depth - (coef[0] * xx / w + coef[1] * yy / h + coef[2])
+    inside = flat[mask] if mask is not None and mask.any() else flat.ravel()
+    lo, hi = np.percentile(inside, [0.5, 99.5])
+    out = np.clip((flat - lo) / max(float(hi - lo), 1e-9), 0, 1)
+    if mask is not None:
+        out = np.where(mask, out, 0.0)
+    return out.astype(np.float32)
+
+
 def shrink(depth, side) -> np.ndarray:
     """Resize so the longest side is at most `side` pixels (averaging, so detail is kept)."""
     h, w = depth.shape
@@ -134,9 +212,17 @@ def save_depth_png(depth, path):
     return path
 
 
-def save_preview_png(depth, path):
-    """8-bit version for looking at (small enough to upload as a picture)."""
-    Image.fromarray((np.clip(depth, 0, 1) * 255).astype(np.uint8)).save(path)
+def save_preview_png(depth, path, mask=None):
+    """8-bit version for looking at (small enough to upload as a picture). With a `mask` (an outlined
+    area) everything outside it is transparent, so a shaped design keeps its shape when it is placed."""
+    grey = (np.clip(depth, 0, 1) * 255).astype(np.uint8)
+    if mask is None:
+        Image.fromarray(grey).save(path)
+    else:
+        if mask.shape != grey.shape:
+            h, w = grey.shape
+            mask = np.asarray(Image.fromarray(mask.astype(np.uint8) * 255).resize((w, h), Image.NEAREST)) > 127
+        Image.fromarray(np.dstack([grey, mask.astype(np.uint8) * 255]), mode="LA").save(path)
     return path
 
 
