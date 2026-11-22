@@ -5,7 +5,6 @@ import sys
 
 import numpy as np
 import pytest
-import torch
 import trimesh
 from PIL import Image
 
@@ -340,6 +339,8 @@ def test_the_relief_mesh_has_the_real_width_and_depth_and_faces_up():
 
 
 def test_depth_training_learns_from_pairs_and_only_saves_an_improvement(tmp_path):
+    torch = pytest.importorskip("torch")  # CI installs only requirements.txt, not the heavy depth-model libraries
+    pytest.importorskip("transformers")
     from transformers import DepthAnythingConfig, DepthAnythingForDepthEstimation, Dinov2Config
 
     import train_depth
