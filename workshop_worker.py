@@ -259,29 +259,36 @@ def export_models(mesh_or_path, out, stem, width_mm=None, limits=None, mm=False)
         mesh = mesh.simplify_quadric_decimation(face_count=int(len(mesh.faces) * 0.6))
 
 
-def make_gcode(model_path, out, stem, width_mm):
+# (height-map px, finish stepover) in mm, finest first: a wide area makes a G-code file too big for the server
+# (or for the machine's controller), so it is cut again, a little coarser each time, until it fits
+GCODE_COARSER = [(0.5, 0.4), (0.75, 0.6), (1.0, 0.8), (1.5, 1.2)]
+
+
+def _gcode_files(argv, out, stem, limits=None):
+    nc, png = out / f"{stem}.nc", out / f"{stem}-preview.png"
+    limit = (limits or LIMITS)["nc"]
+    for px, stepover in GCODE_COARSER:
+        c = vriksha.parse(argv + ["-o", str(nc), "--preview", str(png), "--px", str(px), "--finish-stepover", str(stepover)])
+        code, tgt, _stats = vriksha.build(c)
+        nc.write_text(code)
+        if nc.stat().st_size <= limit:
+            vriksha.preview(tgt, c.px, png)
+            return [(nc, "nc"), (png, "render")]
+    raise RuntimeError("The G-code is too large for the server even at the coarsest setting. Mark a smaller area, or cut it in parts.")
+
+
+def make_gcode(model_path, out, stem, width_mm, limits=None):
     """Relief G-code and a hill-shade preview from the exported mesh, using vriksha.py."""
     if not width_mm:
         raise RuntimeError("G-code needs the real width of the piece. Enter it on the scan and try again.")
-    nc, png = out / f"{stem}.nc", out / f"{stem}-preview.png"
-    c = vriksha.parse([str(model_path), "--width", str(width_mm), "-o", str(nc), "--preview", str(png)])
-    code, tgt, _stats = vriksha.build(c)
-    nc.write_text(code)
-    vriksha.preview(tgt, c.px, png)
-    return [(nc, "nc"), (png, "render")]
+    return _gcode_files([str(model_path), "--width", str(width_mm)], out, stem, limits)
 
 
-def make_gcode_depth(depth_png, out, stem, width_mm):
+def make_gcode_depth(depth_png, out, stem, width_mm, limits=None):
     """Relief G-code and a hill-shade preview straight from the depth map (vriksha.py's picture input)."""
     if not width_mm:
         raise RuntimeError("G-code needs the real width of the piece. Enter it on the scan and try again.")
-    nc, png = out / f"{stem}.nc", out / f"{stem}-preview.png"
-    argv = [str(depth_png), "--width", str(width_mm), "--max-depth", str(relief.RELIEF_DEPTH_MM), "--floor", str(relief.FLOOR), "-o", str(nc), "--preview", str(png)]
-    c = vriksha.parse(argv)
-    code, tgt, _stats = vriksha.build(c)
-    nc.write_text(code)
-    vriksha.preview(tgt, c.px, png)
-    return [(nc, "nc"), (png, "render")]
+    return _gcode_files([str(depth_png), "--width", str(width_mm), "--max-depth", str(relief.RELIEF_DEPTH_MM), "--floor", str(relief.FLOOR)], out, stem, limits)
 
 
 def relief_files(images, folder, params, progress, estimate=None):

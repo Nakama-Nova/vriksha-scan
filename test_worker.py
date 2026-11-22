@@ -168,6 +168,15 @@ def test_gcode_needs_the_real_width_and_makes_a_cutting_file_and_preview(tmp_pat
     assert files[1][0].suffix == ".png" and files[1][0].stat().st_size > 0
 
 
+def test_gcode_too_big_for_the_server_is_cut_again_coarser_until_it_fits(tmp_path):
+    stl = w.export_models(make_ply(tmp_path / "m.ply"), tmp_path / "out", "model", 40)[1][0]
+    fine = w.make_gcode(stl, tmp_path / "out", "model", 40)[0][0].stat().st_size
+    fits = w.make_gcode(stl, tmp_path / "out", "model", 40, limits={"nc": fine - 1})[0][0].stat().st_size
+    assert fits < fine  # coarser, so smaller
+    with pytest.raises(RuntimeError, match="too large"):
+        w.make_gcode(stl, tmp_path / "out", "model", 40, limits={"nc": 100})
+
+
 def test_progress_only_renews_the_lease_when_a_minute_has_passed():
     now = [1000.0]
     api = FakeApi()
