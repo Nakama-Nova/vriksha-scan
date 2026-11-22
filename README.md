@@ -96,6 +96,15 @@ python workshop_worker.py --url https://your-server --user workshop-pc
 One pair in ten is held out. The tuned model is saved **only if it beats the original on those held-out pairs**;
 otherwise the script says so and nothing changes. Keep the tuned folder with the machine that runs the worker.
 
+## Video to 3D on a free Colab GPU
+
+`colab/video_to_3d_colab.ipynb` (upload it in Colab, set the runtime to a T4 GPU, run the cells top to bottom) turns a video into a point cloud, keeps
+**only the piece** (the wall and floor are dropped by point density, with a before/after picture), stands it upright, sets its **real size** from
+`REAL_HEIGHT_MM`, and exports `model.glb`, `model.stl` and a **front-view depth map** (`figure_depth.png`, white = nearest) that `vriksha.py` cuts from.
+The printed carving command has the real width and depth filled in. For a flat or half-round carving film a slow arc about 60 degrees each side,
+with a patterned cloth behind and a ruler beside the piece. Its crop and depth-map steps were run on a real scan here; the COLMAP and Poisson steps
+need Colab's GPU libraries and were not.
+
 ## Licence
 
 Proprietary software. Copyright (c) 2026 Nakama Nova, all rights reserved. It may not be copied, modified or shared; see `LICENSE`.
