@@ -1,6 +1,11 @@
 # Vriksha Studios — scan → CNC pipeline
 
-Temple relief scan (photogrammetry mesh) → 3-axis G-code. Python 3.10+.
+Temple relief scan (photogrammetry mesh) → 3-axis G-code. Python 3.10+ (CI runs 3.12, on Linux and Windows).
+
+This repository has two tools:
+
+- **`vriksha.py`**: the converter, mesh or depth image to G-code. Runs on its own.
+- **`workshop_worker.py`**: the workshop-PC worker. It takes scans that staff upload from the phone app ([vriksha-mobile](https://github.com/Nakama-Nova/vriksha-mobile)) to the shop server ([nakamadesk-backend](https://github.com/Nakama-Nova/nakamadesk-backend)), builds the 3D model and G-code, and uploads the result.
 
 ```bash
 python -m venv .venv && .venv/Scripts/pip install -r requirements.txt   # Windows; use .venv/bin on Linux/Mac
@@ -40,6 +45,8 @@ python workshop_worker.py --url https://your-server --user workshop-pc          
 python workshop_worker.py --url https://your-server --user workshop-pc --once   # one pass, then stops
 ```
 
+Other options: `--worker NAME` (a name for this PC, default `workshop-pc`), `--work-dir DIR` (scratch space, default a `vriksha-worker` folder in the system temp), `--keep` (keep each job's working files), `--colmap` / `--ffmpeg` (tool paths), `--mode auto|full|relief`. `--url` and `--user` can also come from the `VRIKSHA_URL` and `VRIKSHA_USER` environment variables.
+
 First create the sign-in in the desktop app: Staff, Add staff, role **Artisan (restoration)** (or use the
 owner). A manager cannot run restoration scans. The worker asks for the password when it starts; just type
 it there (nothing shows as you type). Do not paste it into chat or a file. If you prefer an environment
@@ -65,6 +72,14 @@ and reads `dense/0/meshed-poisson.ply`; if your COLMAP build words an option dif
 The flat-carving depth is a model's guess: relative, front face only, no undercuts, and its size comes from the
 real width entered on the scan (without one the model is marked "size not set"). Use the full route when the
 true shape matters.
+
+**A marked area of a photo.** A flat-carving scan can carry `params.crop`: four corners (clockwise from the
+top-left) and, optionally, an outline, marked on one photo in the Lab editor. The worker straightens the four
+corners into a rectangle (so a slanted shot of a headboard reads like a straight-on one), enlarges small areas to
+at least 1500 px (the depth model reads a repeating pattern such as a tufted lattice as a blur when it is small),
+reads the depth, takes out the slope the slanted photo adds, and, with an outline, makes everything outside it
+background and transparent in the picture, so a shaped crown keeps its shape. The shape of the area comes from the
+real width and height entered, else from the corners. Check the depth in millimetres on scrap before cutting.
 
 - The widest side of the model is set to the real width entered on the scan (mm). G-code needs that width.
 - A model larger than the server accepts is simplified, the same way for every format, until each file fits.
@@ -104,6 +119,29 @@ otherwise the script says so and nothing changes. Keep the tuned folder with the
 The printed carving command has the real width and depth filled in. For a flat or half-round carving film a slow arc about 60 degrees each side,
 with a patterned cloth behind and a ruler beside the piece. Its crop and depth-map steps were run on a real scan here; the COLMAP and Poisson steps
 need Colab's GPU libraries and were not.
+
+## Run it by itself (Windows)
+
+The worker has to run on a workshop PC: the full 3D route needs that PC's NVIDIA GPU and COLMAP, and flat carvings need a ~1 GB depth model, so it cannot run on Vercel (short-lived functions, no GPU). Instead make the PC start it for you:
+
+```powershell
+# once, in this folder
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt -r requirements-relief.txt   # drop the second file if flat carvings are not wanted
+.venv\Scripts\python workshop_worker.py --url https://api.vrikshastudios.com --user workshop-pc --save-password
+.\install-autostart.ps1 -Url https://api.vrikshastudios.com -User workshop-pc
+```
+
+- `--save-password` asks for the password (nothing shows as you type), signs in to check it, and keeps it in the **Windows Credential Manager** under your Windows user. It is never written to a file, a script or the scheduled task. A wrong password is not saved. `--forget-password` removes it.
+- `install-autostart.ps1` registers a scheduled task "Vriksha Scan Worker": it starts when this Windows user signs in, runs hidden, restarts a minute after a crash, and never runs two copies. `.\install-autostart.ps1 -Remove` undoes it; `-DryRun` shows what it would do.
+- **Which account decides what the worker may process** (the server checks this, not the worker): an **owner** account can process everything; a **manager** account only product scans (furniture and other products); an **artisan** account only restoration and sculpture scans. So a PC that should do furniture carvings needs an owner or manager account, and one for temple restorations an owner or artisan account. Give the worker its own login (for example `workshop-pc`), not a person's.
+- The log is `%LOCALAPPDATA%\VrikshaScan\worker.log` (about 1 MB, three older files kept). Status: `Get-ScheduledTask -TaskName 'Vriksha Scan Worker' | Get-ScheduledTaskInfo`.
+- Set the PC to sign in by itself after a restart and not to sleep while plugged in; while it is asleep or signed out, scans just wait.
+- `--unattended` (what the task uses) never asks for a password, keeps trying to sign in if the network is not up yet, and keeps going after an unexpected error. If the password was changed or the account is locked or switched off, it tries again only once an hour: the server locks an account after 5 failed sign-ins in 15 minutes, and that lock would also stop the same person using the desktop app. After changing the account's password, run `--save-password` again.
+
+## Tests and CI
+
+`python -m pytest` runs `test_vriksha.py` (the converter, on a synthetic dome) and `test_worker.py`. CI (`.github/workflows/ci.yml`) does the same on Linux and Windows, plus flake8 for syntax errors and undefined names only. COLMAP itself is not tested in CI.
 
 ## Licence
 

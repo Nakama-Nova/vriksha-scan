@@ -8,7 +8,6 @@ import pytest
 import torch
 import trimesh
 from PIL import Image
-from scipy.ndimage import gaussian_filter
 
 import relief
 import workshop_worker as w
@@ -340,24 +339,6 @@ def test_the_relief_mesh_has_the_real_width_and_depth_and_faces_up():
     assert flat.extents[2] == pytest.approx(0)
 
 
-def test_tiled_refinement_recovers_detail_a_resolution_capped_model_loses():
-    n = 256
-    ramp = np.tile(np.linspace(0, 1, n, dtype=np.float32), (n, 1))
-    truth = ramp + 0.1 * np.sin(np.arange(n) * 2 * np.pi / 6)[None, :]  # fine carved detail, 6 px period
-
-    def capped_model(img):  # reads any image at 64 px (like the real model's fixed input size), so crops come out sharper
-        g = np.asarray(img.convert("L"), dtype=np.float32) / 255
-        small = Image.fromarray(g, mode="F").resize((64, 64), Image.BOX)
-        return np.asarray(small.resize(img.size, Image.BILINEAR), dtype=np.float32)
-
-    photo = Image.fromarray((np.clip(truth, 0, 1) * 255).astype(np.uint8)).convert("RGB")
-    base = capped_model(photo)
-    out = relief.refine(photo, capped_model)
-    fine = lambda a: a - gaussian_filter(a, 4)
-    corr = lambda a: np.corrcoef(fine(a).ravel(), fine(truth).ravel())[0, 1]
-    assert corr(out) > corr(base) + 0.1
-
-
 def test_depth_training_learns_from_pairs_and_only_saves_an_improvement(tmp_path):
     from transformers import DepthAnythingConfig, DepthAnythingForDepthEstimation, Dinov2Config
 
@@ -496,3 +477,365 @@ def test_a_video_scan_is_cut_into_frames_first(tmp_path, fake_http, monkeypatch)
     api = FakeApi(photos=1, kind="video")
     assert w.process(api, scan(), tmp_path, reconstruct=fake_reconstruct) == "done"
     assert cut == ["0000.jpg"]  # the first downloaded file is the video
+
+
+# ---------------------------------------------------------------- running by itself (no one at the PC)
+class FakeKeyring:
+    def __init__(self, saved=None):
+        self.store = dict(saved or {})
+
+    def get_password(self, service, key):
+        return self.store.get((service, key))
+
+    def set_password(self, service, key, password):
+        self.store[(service, key)] = password
+
+    def delete_password(self, service, key):
+        del self.store[(service, key)]
+
+
+def use_keyring(monkeypatch, saved=None):
+    kr = FakeKeyring(saved)
+    monkeypatch.setattr(w, "_keyring", lambda: kr)
+    return kr
+
+
+def no_prompt(monkeypatch):
+    def prompt(*a, **k):
+        raise AssertionError("an unattended worker must never ask for a password")
+
+    monkeypatch.setattr(w.getpass, "getpass", prompt)
+
+
+def test_the_password_comes_from_the_environment_then_the_saved_one_then_a_prompt(monkeypatch):
+    key = ("vriksha-scan", "u@https://x")
+    use_keyring(monkeypatch, {key: "saved"})
+    monkeypatch.setenv("VRIKSHA_PASSWORD", "env")
+    assert w.get_password("https://x/", "u", unattended=True) == "env"
+    monkeypatch.delenv("VRIKSHA_PASSWORD")
+    assert w.get_password("https://x/", "u", unattended=True) == "saved"
+    use_keyring(monkeypatch)  # nothing saved
+    assert w.get_password("https://x", "u", unattended=True) is None  # never a prompt when unattended
+    monkeypatch.setattr(w.sys, "stdin", type("S", (), {"isatty": lambda self: True})())
+    monkeypatch.setattr(w.getpass, "getpass", lambda prompt: "typed")
+    assert w.get_password("https://x", "u") == "typed"
+    monkeypatch.setattr(w.sys, "stdin", None)  # pythonw has no console to ask on
+    assert w.get_password("https://x", "u") is None
+
+
+def test_unattended_with_no_password_says_what_to_do_and_stops(monkeypatch, capsys):
+    use_keyring(monkeypatch)
+    no_prompt(monkeypatch)
+    monkeypatch.delenv("VRIKSHA_PASSWORD", raising=False)
+    assert w.main(["--url", "https://x", "--user", "u", "--unattended"]) == 2
+    assert "--save-password" in capsys.readouterr().out
+
+
+def test_unattended_waits_for_the_network_at_start_and_then_runs(monkeypatch, capsys):
+    calls, sleeps = [], []
+
+    class H:
+        def post(self, url, **kw):
+            calls.append(1)
+            if len(calls) <= 2:
+                raise w.requests.ConnectionError("network is not up yet")
+            return FakeResp(200, body={"access_token": "t", "role": "artisan"})
+
+        def request(self, method, url, **kw):
+            return FakeResp(200, body=[])
+
+    monkeypatch.setattr(w, "http", H())
+    monkeypatch.setattr(w.time, "sleep", sleeps.append)
+    use_keyring(monkeypatch, {("vriksha-scan", "u@https://x"): "pw"})
+    assert w.main(["--url", "https://x", "--user", "u", "--unattended", "--once"]) == 0
+    assert sleeps == [60, 60] and len(calls) == 3
+    assert "signed in" in capsys.readouterr().out
+
+
+def test_a_wrong_password_is_never_retried_quickly(monkeypatch, capsys):
+    """5 failed sign-ins in 15 minutes lock the account on the server, for the desktop app too."""
+    posts, sleeps = [], []
+
+    class H:
+        def post(self, url, **kw):
+            posts.append(1)
+            return FakeResp(401, body={"detail": "Invalid credentials"})
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(w, "http", H())
+    monkeypatch.setattr(w.time, "sleep", sleep)
+    monkeypatch.setenv("VRIKSHA_PASSWORD", "wrong")
+    assert w.main(["--url", "https://x", "--user", "u", "--unattended"]) == 0
+    assert sleeps == [3600, 3600] and len(posts) == 2  # one try per hour, and Ctrl+C stops it
+    assert "stopped" in capsys.readouterr().out
+
+
+def test_a_password_changed_while_running_does_not_lock_the_account(monkeypatch, capsys):
+    posts, sleeps = [], []
+
+    class H:
+        def post(self, url, **kw):
+            posts.append(1)
+            if len(posts) == 1:
+                return FakeResp(200, body={"access_token": "t", "role": "artisan"})
+            return FakeResp(401, body={"detail": "Invalid credentials"})
+
+        def request(self, method, url, **kw):
+            return FakeResp(401)  # the token no longer works
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(w, "http", H())
+    monkeypatch.setattr(w.time, "sleep", sleep)
+    monkeypatch.setenv("VRIKSHA_PASSWORD", "old")
+    assert w.main(["--url", "https://x", "--user", "u"]) == 0
+    assert sleeps == [3600] and len(posts) == 2  # not one failed sign-in every 30 s
+    assert "sign-in refused" in capsys.readouterr().out
+
+
+def test_a_bug_in_one_pass_does_not_stop_a_worker_nobody_is_watching(monkeypatch, capsys):
+    polls, sleeps = [], []
+
+    class H:
+        def post(self, url, **kw):
+            return FakeResp(200, body={"access_token": "t", "role": "artisan"})
+
+        def request(self, method, url, **kw):
+            polls.append(1)
+            if len(polls) == 1:
+                raise ValueError("something unexpected")
+            return FakeResp(200, body=[])
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(w, "http", H())
+    monkeypatch.setattr(w.time, "sleep", sleep)
+    monkeypatch.setenv("VRIKSHA_PASSWORD", "x")
+    assert w.main(["--url", "https://x", "--user", "u", "--unattended"]) == 0
+    assert sleeps == [30, 30] and len(polls) == 2
+    assert "ValueError: something unexpected" in capsys.readouterr().err
+    # by hand with --once the error is still raised, as before
+    polls.clear()
+    with pytest.raises(ValueError):
+        w.main(["--url", "https://x", "--user", "u", "--once"])
+
+
+def test_everything_printed_also_goes_to_a_small_log_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(w.sys, "stdout", w.sys.stdout)  # put the real ones back afterwards
+    monkeypatch.setattr(w.sys, "stderr", w.sys.stderr)
+    log = tmp_path / "logs" / "worker.log"
+    w.start_log_file(str(log))
+    print("signed in as carver")
+    print("half a line", end="")
+    print(" and the rest")
+    w.sys.stderr.write("Traceback (most recent call last):\n")
+    for h in w.logging.getLogger("vriksha-worker").handlers:
+        h.flush()
+        h.close()
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert any(line.endswith("signed in as carver") and line[:4].isdigit() for line in lines)  # starts with the date
+    assert any(line.endswith("half a line and the rest") for line in lines)
+    assert any("Traceback" in line for line in lines)
+
+
+def test_save_password_checks_it_first_and_forget_removes_it(monkeypatch, capsys):
+    kr = use_keyring(monkeypatch)
+    monkeypatch.setattr(w.getpass, "getpass", lambda prompt: "right")
+    monkeypatch.setattr(w, "http", signed_in_http("artisan"))
+    assert w.main(["--url", "https://x/", "--user", "carver", "--save-password"]) == 0
+    assert kr.store == {("vriksha-scan", "carver@https://x"): "right"}
+    assert "right" not in capsys.readouterr().out  # the password is never printed
+    assert w.get_password("https://x", "carver", unattended=True) == "right"
+    assert w.main(["--url", "https://x", "--user", "carver", "--forget-password"]) == 0
+    assert kr.store == {}
+
+
+def test_a_wrong_password_is_not_saved(monkeypatch):
+    kr = use_keyring(monkeypatch)
+    monkeypatch.setattr(w.getpass, "getpass", lambda prompt: "wrong")
+
+    class H:
+        def post(self, url, **kw):
+            return FakeResp(401, body={"detail": "Invalid credentials"})
+
+    monkeypatch.setattr(w, "http", H())
+    assert w.main(["--url", "https://x", "--user", "carver", "--save-password"]) == 1
+    assert kr.store == {}
+
+
+def test_saving_needs_the_keyring_package(monkeypatch, capsys):
+    monkeypatch.setattr(w, "_keyring", lambda: None)
+    assert w.main(["--url", "https://x", "--user", "carver", "--save-password"]) == 1
+    assert "pip install keyring" in capsys.readouterr().out
+
+
+def test_the_autostart_script_uses_flags_the_worker_has(capsys):
+    from pathlib import Path
+
+    script = (Path(__file__).parent / "install-autostart.ps1").read_text(encoding="utf-8")
+    with pytest.raises(SystemExit):
+        w.main(["--help"])
+    help_text = capsys.readouterr().out
+    for flag in ("--unattended", "--log-file", "--url", "--user", "--worker"):
+        assert flag in script and flag in help_text
+    assert "AtLogOn" in script and "RestartCount" in script and "MultipleInstances" in script
+
+
+
+def test_fine_shading_in_the_photo_is_added_to_the_depth_but_not_broad_light():
+    flat = np.full((60, 80), 0.5, dtype=np.float32)
+    flat[0, 0] = 1.0  # some depth range, so the gain has a scale
+    lum = np.tile(np.linspace(0, 255, 80), (60, 1))  # broad lighting only: nothing fine
+    lum[30, 40] = 255  # one bright speck on a ridge
+    out = relief.shade_detail(flat, Image.fromarray(lum.astype(np.uint8)), gain=0.2)
+    assert out[30, 40] - flat[30, 40] > 0.05  # the speck is raised
+    assert abs(out[30, 10] - flat[30, 10]) < 0.01  # the gentle gradient is left alone
+    assert np.array_equal(relief.shade_detail(flat, Image.new("L", (80, 60)), gain=0.2), flat)  # flat photo: no change
+
+
+# ---------------------------------------------------------------- a marked area of a photo
+def photo_with_corner_dots(path, quad, size=(600, 400)):
+    """A dark photo with a coloured dot on each corner of the marked area (red, green, blue, yellow)."""
+    img = Image.new("RGB", size, (20, 20, 20))
+    for (x, y), colour in zip(quad, [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)]):
+        img.paste(colour, (int(x) - 12, int(y) - 12, int(x) + 12, int(y) + 12))
+    img.save(path)
+    return img
+
+
+def test_a_slanted_area_is_straightened_so_each_corner_lands_in_its_corner(tmp_path):
+    quad = [[100, 60], [500, 100], [480, 330], [130, 300]]  # a headboard seen from an angle
+    photo_with_corner_dots(tmp_path / "p.png", quad)
+    straight, mask = relief.rectify_area(tmp_path / "p.png", {"quad": quad})
+    assert mask is None
+    a = np.asarray(straight).astype(int)
+    h, w = a.shape[:2]
+    for (cx, cy), channel in [((6, 6), 0), ((w - 7, 6), 1), ((w - 7, h - 7), 2), ((6, h - 7), None)]:
+        px = a[cy, cx]
+        if channel is None:
+            assert px[0] > 200 and px[1] > 200 and px[2] < 80  # yellow
+        else:
+            assert px[channel] > 200 and sum(px) - px[channel] < 120
+
+
+def test_an_upright_area_is_just_the_crop_enlarged(tmp_path):
+    rng = np.random.default_rng(1)
+    base = np.asarray(Image.fromarray(rng.integers(0, 255, (30, 40, 3), dtype=np.uint8)).resize((400, 300), Image.BICUBIC))
+    Image.fromarray(base).save(tmp_path / "p.png")
+    straight, _ = relief.rectify_area(tmp_path / "p.png", {"quad": [[50, 40], [250, 40], [250, 140], [50, 140]]})
+    small = np.asarray(straight.resize((200, 100), Image.BOX)).astype(int)
+    assert np.abs(small - base[40:140, 50:250].astype(int)).mean() < 8  # same picture, more pixels
+
+
+def test_the_straightened_size_follows_the_real_shape_and_small_areas_are_enlarged():
+    quad = [[0, 0], [300, 0], [300, 100], [0, 100]]
+    w1, h1 = relief.area_size(quad)
+    assert max(w1, h1) == relief.AREA_MIN_SIDE and abs(w1 / h1 - 3) < 0.01  # from the corners, enlarged
+    w2, h2 = relief.area_size(quad, real_w=900, real_h=450)
+    assert abs(w2 / h2 - 2) < 0.01  # the owner's measurements win
+    w3, h3 = relief.area_size([[0, 0], [4000, 0], [4000, 1000], [0, 1000]])
+    assert max(w3, h3) == relief.PHOTO_SIDE and abs(w3 / h3 - 4) < 0.01  # never beyond what the model takes
+    w4, h4 = relief.area_size([[0, 0], [100, 0], [100, 400], [0, 400]])
+    assert h4 == relief.AREA_MIN_SIDE and w4 < h4  # a tall area
+
+
+def test_the_outline_becomes_a_mask_in_the_straightened_picture(tmp_path):
+    Image.new("RGB", (400, 300), "white").save(tmp_path / "p.png")
+    quad = [[100, 50], [300, 50], [300, 150], [100, 150]]
+    outline = [[200, 55], [295, 145], [105, 145]]  # a triangle: point up
+    straight, mask = relief.rectify_area(tmp_path / "p.png", {"quad": quad, "outline": outline})
+    assert mask.shape == (straight.height, straight.width)
+    h, w = mask.shape
+    assert mask[int(h * 0.8), w // 2] and not mask[5, 5] and not mask[5, w - 5]  # inside the triangle, outside its corners
+
+
+def test_flatten_takes_out_a_slope_but_keeps_the_carving(tmp_path):
+    y, x = np.mgrid[0:120, 0:200]
+    carving = 0.1 * ((x // 10 + y // 10) % 2)  # a checker of ridges
+    slanted = (0.6 * x / 200 + carving).astype(np.float32)
+    out = relief.flatten(slanted)
+    assert abs(float(out[:, -60:].mean() - out[:, :60].mean())) < 0.05  # no slope left
+    assert np.corrcoef(out.ravel(), carving.ravel())[0, 1] > 0.9  # the ridges are what is left
+    assert out.min() >= 0 and out.max() <= 1
+
+
+def test_flatten_makes_everything_outside_the_outline_background():
+    d = np.random.default_rng(2).random((60, 80)).astype(np.float32)
+    mask = np.zeros((60, 80), dtype=bool)
+    mask[10:50, 20:60] = True
+    out = relief.flatten(d, mask)
+    assert (out[~mask] == 0).all() and out[mask].max() > 0.9
+    small = relief.flatten(d, np.asarray(Image.fromarray(mask.astype(np.uint8) * 255).resize((40, 30), Image.NEAREST)) > 127)
+    assert small.shape == d.shape  # a mask of another size is fitted to the depth
+
+
+def test_the_preview_keeps_the_shape_of_an_outlined_design(tmp_path):
+    d = np.full((20, 30), 0.5, dtype=np.float32)
+    mask = np.zeros((20, 30), dtype=bool)
+    mask[:, 10:20] = True
+    relief.save_preview_png(d, tmp_path / "plain.png")
+    relief.save_preview_png(d, tmp_path / "shaped.png", mask=mask)
+    assert Image.open(tmp_path / "plain.png").mode == "L"
+    shaped = Image.open(tmp_path / "shaped.png")
+    assert shaped.mode == "LA" and shaped.getpixel((15, 5))[1] == 255 and shaped.getpixel((2, 5))[1] == 0  # transparent outside
+
+
+class Quiet:
+    def set(self, percent, note):
+        pass
+
+
+def test_a_marked_area_is_straightened_before_the_depth_is_read_and_flattened_after(tmp_path, monkeypatch):
+    monkeypatch.setattr(relief, "AREA_MIN_SIDE", 120)  # keep the test small
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    photo_with_corner_dots(photos / "a.png", [[100, 60], [500, 100], [480, 330], [130, 300]])
+    seen = []
+
+    def estimate(path):
+        seen.append(Image.open(path).size)
+        y, x = np.mgrid[0:60, 0:90]
+        return (x / 90 + 0.2 * ((x // 6 + y // 6) % 2)).astype(np.float32)  # a slope plus ridges
+
+    crop = {"quad": [[100, 60], [500, 100], [480, 330], [130, 300]], "outline": [[150, 90], [450, 120], [300, 300]]}
+    files = w.relief_files(photos, tmp_path / "work", {"real_width_mm": 600, "gcode": False, "crop": crop}, Quiet(), estimate=estimate)
+    assert seen == [relief.area_size([tuple(p) for p in crop["quad"]])]  # the model read the straightened area, not the photo
+    kinds = [k for _, k in files]
+    assert kinds == ["glb", "stl", "obj", "ply", "render"]
+    picture = Image.open([p for p, k in files if k == "render"][0])
+    assert picture.mode == "LA" and picture.getpixel((0, 0))[1] == 0  # shaped like the outline
+    depth = np.asarray(Image.open(tmp_path / "work" / "depth.png")).astype(float) / 65535
+    assert abs(depth[:, -20:].mean() - depth[:, :20].mean()) < 0.2  # the slope the photo added is gone
+
+
+def test_without_a_marked_area_nothing_changes(tmp_path):
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    Image.fromarray(np.random.default_rng(4).integers(0, 255, (60, 80, 3), dtype=np.uint8)).save(photos / "a.jpg")
+    seen = []
+
+    def estimate(path):
+        seen.append(Image.open(path).size)
+        return gradient_depth(path)
+
+    files = w.relief_files(photos, tmp_path / "work", {"real_width_mm": 40}, Quiet(), estimate=estimate)
+    assert seen == [(80, 60)] and Image.open([p for p, k in files if k == "render"][0]).mode == "L"
+
+
+def test_a_whole_job_for_a_marked_area_finishes(tmp_path, fake_http):
+    api = FakeApi(photos=1)
+    crop = {"quad": [[10, 8], [70, 8], [70, 52], [10, 52]], "outline": [[12, 10], [68, 10], [40, 50]]}
+    params = {"shape": "relief", "real_width_mm": 600, "gcode": False, "label": "Headboard lotus", "crop": crop}
+    out = w.process(api, {**scan(), "params": params}, tmp_path, estimate=gradient_depth)
+    assert out == "done" and api.failed is None
+    assert [a["kind"] for a in api.assets] == ["glb", "stl", "obj", "ply", "render"]
+
