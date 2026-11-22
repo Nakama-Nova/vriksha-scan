@@ -338,6 +338,30 @@ def test_the_relief_mesh_has_the_real_width_and_depth_and_faces_up():
     assert flat.extents[2] == pytest.approx(0)
 
 
+def test_depth_training_learns_from_pairs_and_only_saves_an_improvement(tmp_path):
+    torch = pytest.importorskip("torch")  # CI installs only requirements.txt, not the heavy depth-model libraries
+    pytest.importorskip("transformers")
+    from transformers import DepthAnythingConfig, DepthAnythingForDepthEstimation, Dinov2Config
+
+    import train_depth
+
+    torch.manual_seed(0)
+    backbone = Dinov2Config(hidden_size=32, num_hidden_layers=4, num_attention_heads=2, out_indices=[1, 2, 3, 4], image_size=56, patch_size=14, reshape_hidden_states=False)
+    model = DepthAnythingForDepthEstimation(DepthAnythingConfig(
+        backbone_config=backbone, reassemble_hidden_size=32, neck_hidden_sizes=[8, 16, 24, 32], fusion_hidden_size=16, head_hidden_size=8))
+    model.head.conv3.bias.data.fill_(0.5)  # a random model starts with a dead final ReLU (all-zero output); a pretrained one does not
+    for i in range(4):  # a photo whose depth is its brightness: something a model can learn
+        g = np.random.default_rng(i).random((64, 64)).astype(np.float32)
+        Image.fromarray((np.stack([g] * 3, -1) * 255).astype(np.uint8)).save(tmp_path / f"c{i}.png")
+        Image.fromarray((g * 65535).astype(np.uint16)).save(tmp_path / f"c{i}.depth.png")
+    pairs = train_depth.find_pairs(tmp_path)
+    assert len(pairs) == 4 and all(".depth" not in p.name for p, _ in pairs)  # depth files are not mistaken for photos
+    before, after = train_depth.train(model, pairs, epochs=25, lr=1e-3, batch=2, crop=56, out=tmp_path / "tuned")
+    assert after < before and (tmp_path / "tuned" / "config.json").exists()
+    with pytest.raises(SystemExit):
+        train_depth.train(model, pairs[:1], epochs=1)  # nothing to hold out
+
+
 def test_shrink_keeps_the_shape_and_never_enlarges():
     big = np.random.default_rng(0).random((400, 800)).astype(np.float32)
     assert relief.shrink(big, 200).shape == (100, 200)

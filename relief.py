@@ -6,13 +6,14 @@ photographed all the way around, use the full COLMAP route in workshop_worker.py
 """
 
 import functools
+import os
 
 import numpy as np
 import trimesh
 from PIL import Image, ImageDraw, ImageOps
 from scipy import ndimage as ndi
 
-MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
+MODEL = os.environ.get("VRIKSHA_DEPTH_MODEL", "depth-anything/Depth-Anything-V2-Small-hf")  # or a folder from train_depth.py
 PHOTO_SIDE = 2048  # the photo is read at this size; the model only sees ~518 px at a time, so tiles carry the fine detail
 TILE = 640  # side of one photo tile fed to the model (it is shown at about its native pixels, so nothing is blurred away)
 TILE_OVERLAP = 0.5  # share of a tile shared with its neighbour; the overlap is blended so no seams show

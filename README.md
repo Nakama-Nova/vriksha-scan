@@ -60,7 +60,7 @@ failed) for a PC that can.
 
 | Scan shape | What it is | Needs on the PC |
 |---|---|---|
-| **Flat carving** (`relief`) | A flat or shallow carving read from **one straight-on photo**; if several are sent the sharpest is used. A depth model works out the relief; you get `.glb .stl .obj .ply`, a depth picture and, if asked, G-code. | Any PC, no GPU: `pip install -r requirements-relief.txt` (torch and transformers, about 1 GB, plus a ~100 MB model on the first run). A minute or two on a normal CPU. |
+| **Flat carving** (`relief`) | A flat or shallow carving read from **one straight-on photo**; if several are sent the sharpest is used. A depth model works out the relief; you get `.glb .stl .obj .ply`, a depth picture and, if asked, G-code. | Any PC, no GPU: `pip install -r requirements-relief.txt` (torch and transformers, about 1 GB, plus a ~100 MB model on the first run). A few minutes on a normal CPU (the photo is read whole and as four overlapping crops, to keep fine carved detail). |
 | **Full 3D object** (`full`) | Photos (8 or more) or a video walked all the way around. COLMAP builds a true 3D mesh. | **COLMAP with CUDA** and an **NVIDIA GPU**; for video also **ffmpeg**. Pass `--colmap` / `--ffmpeg` if they are not on PATH. |
 
 When it starts it prints which of the two this PC can do. `--mode relief` or `--mode full` forces one.
@@ -86,6 +86,39 @@ real width and height entered, else from the corners. Check the depth in millime
 - A failed job reports why on the scan (for example "too few overlapping photos") so it can be retaken.
 - The worker renews its claim while COLMAP runs; if the PC dies, the server gives the job to another try (3 in all).
 - `pytest test_worker.py` runs the whole job with a fake server and a synthetic mesh (no GPU needed).
+
+### Training the depth model on your own carvings
+
+The depth model is a general one; it can be tuned on your own carvings so it reads *their* fine detail better.
+It learns from **pairs**: a straight-on photo and the **true depth of that same view**. Put them in one folder:
+
+```
+pairs/
+  ganesha.jpg          ganesha.depth.png    <- 16-bit grey, white = nearest, same view as the photo
+  lotus-panel.jpg      lotus-panel.depth.png
+```
+
+True depth can come from anything accurate that is lined up with the photo (a structured-light or LiDAR scan,
+or a mesh rendered from the photo's own camera pose). A depth map from the model itself teaches it nothing.
+Aim for 100+ pairs, varied in stone, wood, lighting and carving style. Then:
+
+```bash
+python train_depth.py pairs/ --out depth-tuned          # CPU works (slow); an NVIDIA GPU is much faster
+$env:VRIKSHA_DEPTH_MODEL='depth-tuned'                  # PowerShell; use `set` in cmd, `export` in bash
+python workshop_worker.py --url https://your-server --user workshop-pc
+```
+
+One pair in ten is held out. The tuned model is saved **only if it beats the original on those held-out pairs**;
+otherwise the script says so and nothing changes. Keep the tuned folder with the machine that runs the worker.
+
+## Video to 3D on a free Colab GPU
+
+`colab/video_to_3d_colab.ipynb` (upload it in Colab, set the runtime to a T4 GPU, run the cells top to bottom) turns a video into a point cloud, keeps
+**only the piece** (the wall and floor are dropped by point density, with a before/after picture), stands it upright, sets its **real size** from
+`REAL_HEIGHT_MM`, and exports `model.glb`, `model.stl` and a **front-view depth map** (`figure_depth.png`, white = nearest) that `vriksha.py` cuts from.
+The printed carving command has the real width and depth filled in. For a flat or half-round carving film a slow arc about 60 degrees each side,
+with a patterned cloth behind and a ruler beside the piece. Its crop and depth-map steps were run on a real scan here; the COLMAP and Poisson steps
+need Colab's GPU libraries and were not.
 
 ## Run it by itself (Windows)
 
