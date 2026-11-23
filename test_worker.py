@@ -469,6 +469,23 @@ def test_a_suggest_job_answers_the_question_and_makes_no_files(tmp_path, fake_ht
     assert "finish" not in api.calls and not any(c.startswith("presign") for c in api.calls)
 
 
+def test_the_cad_folder_job_uploads_one_zip_with_everything_a_designer_needs(tmp_path, fake_http, monkeypatch):
+    import zipfile
+
+    out = tmp_path / "master.png"
+    relief.save_depth_png(gradient_depth(None), out)
+    monkeypatch.setattr(w, "download", lambda api, sid, dest, progress: [out])
+    api = FakeApi(photos=1)
+    params = {"shape": "export", "real_width_mm": 120, "outputs": ["cad"], "label": "Headboard border"}
+    assert w.process(api, {**scan(), "params": params}, tmp_path / "work", keep=True) == "done" and api.failed is None
+    assert [a["kind"] for a in api.assets] == ["cad"] and "CAD folder" in api.assets[0]["alt"]
+    zipped = next((tmp_path / "work").rglob("cad-folder.zip"))
+    with zipfile.ZipFile(zipped) as z:
+        assert sorted(z.namelist()) == ["README.txt", "depth-map.png", "model.obj", "model.stl", "outline.dxf", "outline.svg"]
+        assert "Headboard border" in z.read("README.txt").decode()
+        assert z.getinfo("model.stl").file_size > 1000
+
+
 def test_the_flat_carving_model_is_in_millimetres(tmp_path, fake_http, monkeypatch):
     kept = {}
     real = w.export_models

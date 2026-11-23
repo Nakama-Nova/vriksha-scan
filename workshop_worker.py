@@ -35,6 +35,7 @@ import requests
 import trimesh
 from PIL import Image, ImageOps
 
+import cad_pack
 import relief
 import vriksha
 
@@ -51,8 +52,8 @@ HEARTBEAT_SECONDS = 60  # the server gives a job 30 minutes; any progress call r
 MAX_FRAMES = 300
 MB = 1024 * 1024
 # kind -> largest file the server accepts (media_service.PRIVATE_KINDS)
-LIMITS = {"glb": 100 * MB, "stl": 300 * MB, "obj": 300 * MB, "ply": 300 * MB, "nc": 50 * MB, "render": 15 * MB}
-CONTENT_TYPES = {".glb": "model/gltf-binary", ".stl": "model/stl", ".obj": "model/obj", ".ply": "application/octet-stream", ".nc": "text/plain", ".png": "image/png"}
+LIMITS = {"glb": 100 * MB, "stl": 300 * MB, "obj": 300 * MB, "ply": 300 * MB, "nc": 50 * MB, "render": 15 * MB, "cad": 300 * MB}
+CONTENT_TYPES = {".glb": "model/gltf-binary", ".stl": "model/stl", ".obj": "model/obj", ".ply": "application/octet-stream", ".nc": "text/plain", ".png": "image/png", ".zip": "application/zip"}
 RELIEF_VIEW_SIDE = 512  # grid of the flat-carving 3D view: about 190,000 points
 SUGGEST_MODEL = os.environ.get("VRIKSHA_CLIP_MODEL", "openai/clip-vit-base-patch32")  # about 600 MB, downloaded once
 COLMAP_QUALITY = {"fast": "low", "normal": "medium", "high": "high"}
@@ -365,6 +366,14 @@ def export_files(source, folder, params, progress):
         progress.set(30, "Making the 3D files")
         side = RELIEF_VIEW_SIDE if shapes == (".glb",) else relief.MESH_SIDE  # a light view, or the full shape for a designer
         files += export_models(relief.relief_mesh(depth, width, side=side), out, "relief", mm=True, only=shapes)
+    if "cad" in outputs:
+        progress.set(45, "Making the CAD folder")
+        sizes = {"stl": 100 * MB, "obj": 100 * MB}  # both go in one zip that must fit the server's limit
+        meshes = export_models(relief.relief_mesh(depth, width, side=relief.MESH_SIDE), folder / "cad", "model", mm=True, only=(".stl", ".obj"), limits=sizes)
+        zipped = cad_pack.pack(depth, width, [p for p, _ in meshes], source, out, params.get("label") or "Flat carving")
+        if zipped.stat().st_size > LIMITS["cad"]:
+            raise RuntimeError("The CAD folder is too large for the server. Mark a smaller area.")
+        files.append((zipped, "cad"))
     if "nc" in outputs:
         progress.set(60, "Making the CNC G-code")
         files += [f for f in make_gcode_depth(source, out, "relief", width) if f[1] == "nc"]
@@ -381,7 +390,7 @@ def upload(api, sid, files, label, progress):
             r = http.request(signed["method"], signed["url"], data=f, headers=signed["headers"], timeout=(10, 600))
         if r.status_code not in (200, 201, 204):
             raise RuntimeError(f"Upload of {path.name} failed ({r.status_code})")
-        assets.append({"key": signed["key"], "kind": kind, "visibility": "staff", "content_type": ctype, "alt": f"{label} ({'depth map' if kind == 'depth' else path.suffix[1:].upper()})"})
+        assets.append({"key": signed["key"], "kind": kind, "visibility": "staff", "content_type": ctype, "alt": f"{label} ({ {'depth': 'depth map', 'cad': 'CAD folder'}.get(kind, path.suffix[1:].upper()) })"})
         progress.set(92 + 7 * (i + 1) / len(files), f"Uploaded {path.name}")
     return assets
 
