@@ -17,6 +17,7 @@ step) and, for video scans, ffmpeg, both on PATH or given with --colmap / --ffmp
 import argparse
 import collections
 import getpass
+import functools
 import importlib.util
 import logging
 import logging.handlers
@@ -32,7 +33,7 @@ from pathlib import Path
 import numpy as np
 import requests
 import trimesh
-from PIL import Image
+from PIL import Image, ImageOps
 
 import relief
 import vriksha
@@ -53,6 +54,7 @@ MB = 1024 * 1024
 LIMITS = {"glb": 100 * MB, "stl": 300 * MB, "obj": 300 * MB, "ply": 300 * MB, "nc": 50 * MB, "render": 15 * MB}
 CONTENT_TYPES = {".glb": "model/gltf-binary", ".stl": "model/stl", ".obj": "model/obj", ".ply": "application/octet-stream", ".nc": "text/plain", ".png": "image/png"}
 RELIEF_VIEW_SIDE = 512  # grid of the flat-carving 3D view: about 190,000 points
+SUGGEST_MODEL = os.environ.get("VRIKSHA_CLIP_MODEL", "openai/clip-vit-base-patch32")  # about 600 MB, downloaded once
 COLMAP_QUALITY = {"fast": "low", "normal": "medium", "high": "high"}
 
 
@@ -122,6 +124,9 @@ class Api:
 
     def finish(self, sid, assets):
         return self._call("POST", f"/scans/{sid}/finish", json={"worker": self.worker, "assets": assets})
+
+    def answer(self, sid, picks):
+        return self._call("POST", f"/scans/{sid}/answer", json={"worker": self.worker, "picks": picks})
 
     def fail(self, sid, error):
         return self._call("POST", f"/scans/{sid}/fail", json={"worker": self.worker, "error": error[:500]})
@@ -326,6 +331,23 @@ def relief_files(images, folder, params, progress, estimate=None):
 EXPORT_FORMATS = ("stl", "obj", "ply", "glb")
 
 
+@functools.lru_cache(maxsize=1)
+def _clip():
+    from transformers import pipeline  # already needed for flat carvings
+
+    return pipeline("zero-shot-image-classification", model=SUGGEST_MODEL)
+
+
+def suggest_picks(photo, choices, classify=None):
+    """The three choices ({id, label}) the photo looks most like, best first, as [{id, score}]."""
+    classify = classify or _clip()
+    with Image.open(photo) as img:
+        image = ImageOps.exif_transpose(img).convert("RGB")
+    found = classify(image, candidate_labels=[c["label"] for c in choices], hypothesis_template="a photo of {}.")
+    id_of = {c["label"]: c["id"] for c in choices}
+    return [{"id": id_of[f["label"]], "score": round(float(f["score"]), 4)} for f in sorted(found, key=lambda f: -f["score"])[:3]]
+
+
 def export_files(source, folder, params, progress):
     """Files asked for later: made from a scan's kept depth map at a real width (STL, OBJ, PLY, GLB, CNC G-code)."""
     width, outputs = params.get("real_width_mm"), params.get("outputs") or []
@@ -364,7 +386,7 @@ def upload(api, sid, files, label, progress):
     return assets
 
 
-def process(api, scan, work, colmap="colmap", ffmpeg="ffmpeg", reconstruct=None, estimate=None, keep=False):
+def process(api, scan, work, colmap="colmap", ffmpeg="ffmpeg", reconstruct=None, estimate=None, keep=False, classify=None):
     """One whole job. Raises ApiError if the claim is lost; any other failure is reported to the server."""
     sid, params = scan["id"], scan.get("params") or {}
     shape = params.get("shape", "full")
@@ -375,6 +397,10 @@ def process(api, scan, work, colmap="colmap", ffmpeg="ffmpeg", reconstruct=None,
     reconstruct = reconstruct or (lambda images, ws, q, p: colmap_reconstruct(images, ws, q, p, colmap))
     try:
         sources = download(api, sid, folder / "src", progress)
+        if shape == "suggest":  # a question, not a scan: no files come back
+            progress.set(50, "Looking at the photo")
+            api.answer(sid, suggest_picks(sources[0], params["choices"], classify))
+            return "done"
         if shape == "export":
             files = export_files(sources[0], folder, params, progress)
         else:
@@ -423,9 +449,10 @@ def gpu_available():
 def capabilities(colmap="colmap", ffmpeg="ffmpeg", mode="auto", gpu=None):
     """What this PC can build, as {what: None if it can, else why not}. Looked at again on every pass,
     so installing a tool or driver while the worker runs is noticed."""
-    caps = {"relief": None, "full": None, "video": None}
+    caps = {"relief": None, "full": None, "video": None, "suggest": None}
     if importlib.util.find_spec("torch") is None or importlib.util.find_spec("transformers") is None:
         caps["relief"] = "flat carvings need torch and transformers: pip install -r requirements-relief.txt"
+        caps["suggest"] = "guessing a template from a photo needs torch and transformers: pip install -r requirements-relief.txt"
     if not shutil.which(colmap):
         caps["full"] = f"full 3D needs COLMAP, which was not found ('{colmap}')"
     elif not (gpu_available() if gpu is None else gpu):
@@ -626,7 +653,7 @@ def main(argv=None):
     if api.role == "manager":
         print("note: a manager can only process product scans. Temple restoration scans need an owner or artisan account.")
     caps = capabilities(a.colmap, a.ffmpeg, a.mode)
-    for what, label in (("relief", "flat carvings (one photo, any PC)"), ("full", "full 3D objects (photos all around)")):
+    for what, label in (("relief", "flat carvings (one photo, any PC)"), ("full", "full 3D objects (photos all around)"), ("suggest", "template guess from a photo")):
         print(f"  {label}: " + ("can build" if not caps[what] else f"waiting for a PC that can ({caps[what]})"))
     if caps["video"]:
         print(f"  note: {caps['video']}")
