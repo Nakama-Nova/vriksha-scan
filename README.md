@@ -111,6 +111,13 @@ python workshop_worker.py --url https://your-server --user workshop-pc
 One pair in ten is held out. The tuned model is saved **only if it beats the original on those held-out pairs**;
 otherwise the script says so and nothing changes. Keep the tuned folder with the machine that runs the worker.
 
+### Keep little, make files when asked
+
+A flat carving keeps only small files: the picture, a light `.glb` for the 3D view and its **depth map** (`depth`, 16-bit grey PNG, the master).
+STL, OBJ, PLY, GLB and CNC G-code are made **when someone asks** (the Lab's "Get files" buttons under a finished scan): the server queues a job with
+`shape: export` whose only input is that depth map, and this worker builds just the files asked for, at the real width given. Update the **server first**,
+then this worker (the server must know the `depth` file kind before a worker uploads one).
+
 ## Video to 3D on a free Colab GPU
 
 `colab/video_to_3d_colab.ipynb` (upload it in Colab, set the runtime to a T4 GPU, run the cells top to bottom) turns a video into a point cloud, keeps

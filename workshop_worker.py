@@ -29,8 +29,10 @@ import time
 import traceback
 from pathlib import Path
 
+import numpy as np
 import requests
 import trimesh
+from PIL import Image
 
 import relief
 import vriksha
@@ -314,9 +316,36 @@ def relief_files(images, folder, params, progress, estimate=None):
     files = export_models(relief.relief_mesh(depth, width or 100.0, side=RELIEF_VIEW_SIDE), out, "relief", mm=True, only=(".glb",))
     depth_png = relief.save_depth_png(depth, folder / "depth.png")
     files.append((relief.save_preview_png(depth, out / "relief-depth.png", mask=mask), "render"))
+    files.append((depth_png, "depth"))  # the master: STL, OBJ, PLY, GLB and G-code can all be made from it on request
     if params.get("gcode"):
         progress.set(85, "Making the CNC G-code")
         files += make_gcode_depth(depth_png, out, "relief", width)
+    return files
+
+
+EXPORT_FORMATS = ("stl", "obj", "ply", "glb")
+
+
+def export_files(source, folder, params, progress):
+    """Files asked for later: made from a scan's kept depth map at a real width (STL, OBJ, PLY, GLB, CNC G-code)."""
+    width, outputs = params.get("real_width_mm"), params.get("outputs") or []
+    if not width:
+        raise RuntimeError("The real width of the area is needed to make these files.")
+    if not outputs:
+        raise RuntimeError("No files were asked for.")
+    out = folder / "out"
+    out.mkdir(parents=True, exist_ok=True)
+    raw = np.asarray(Image.open(source))
+    depth = raw.astype(np.float32) / (65535.0 if raw.dtype == np.uint16 else 255.0)
+    files = []
+    shapes = tuple(f".{k}" for k in EXPORT_FORMATS if k in outputs)
+    if shapes:
+        progress.set(30, "Making the 3D files")
+        side = RELIEF_VIEW_SIDE if shapes == (".glb",) else relief.MESH_SIDE  # a light view, or the full shape for a designer
+        files += export_models(relief.relief_mesh(depth, width, side=side), out, "relief", mm=True, only=shapes)
+    if "nc" in outputs:
+        progress.set(60, "Making the CNC G-code")
+        files += [f for f in make_gcode_depth(source, out, "relief", width) if f[1] == "nc"]
     return files
 
 
@@ -330,7 +359,7 @@ def upload(api, sid, files, label, progress):
             r = http.request(signed["method"], signed["url"], data=f, headers=signed["headers"], timeout=(10, 600))
         if r.status_code not in (200, 201, 204):
             raise RuntimeError(f"Upload of {path.name} failed ({r.status_code})")
-        assets.append({"key": signed["key"], "kind": kind, "visibility": "staff", "content_type": ctype, "alt": f"{label} ({path.suffix[1:].upper()})"})
+        assets.append({"key": signed["key"], "kind": kind, "visibility": "staff", "content_type": ctype, "alt": f"{label} ({'depth map' if kind == 'depth' else path.suffix[1:].upper()})"})
         progress.set(92 + 7 * (i + 1) / len(files), f"Uploaded {path.name}")
     return assets
 
@@ -346,22 +375,25 @@ def process(api, scan, work, colmap="colmap", ffmpeg="ffmpeg", reconstruct=None,
     reconstruct = reconstruct or (lambda images, ws, q, p: colmap_reconstruct(images, ws, q, p, colmap))
     try:
         sources = download(api, sid, folder / "src", progress)
-        if job["source_kind"] == "video":
-            progress.set(10, "Cutting the video into frames")
-            images = frames_from_video(sources[0], folder / "frames", ffmpeg, progress=progress, min_frames=1 if shape == "relief" else 8)
+        if shape == "export":
+            files = export_files(sources[0], folder, params, progress)
         else:
-            images = folder / "src"
-        if shape == "relief":
-            files = relief_files(images, folder, params, progress, estimate)
-        else:
-            mesh = reconstruct(images, folder / "colmap", params.get("quality", "normal"), progress)
-            progress.set(80, "Making the 3D files")
-            width = params.get("real_width_mm")
-            files = export_models(mesh, folder / "out", "model", width)
-            if params.get("gcode"):
-                progress.set(88, "Making the CNC G-code")
-                stl = next(p for p, k in files if k == "stl")
-                files += make_gcode(stl, folder / "out", "model", width)
+            if job["source_kind"] == "video":
+                progress.set(10, "Cutting the video into frames")
+                images = frames_from_video(sources[0], folder / "frames", ffmpeg, progress=progress, min_frames=1 if shape == "relief" else 8)
+            else:
+                images = folder / "src"
+            if shape == "relief":
+                files = relief_files(images, folder, params, progress, estimate)
+            else:
+                mesh = reconstruct(images, folder / "colmap", params.get("quality", "normal"), progress)
+                progress.set(80, "Making the 3D files")
+                width = params.get("real_width_mm")
+                files = export_models(mesh, folder / "out", "model", width)
+                if params.get("gcode"):
+                    progress.set(88, "Making the CNC G-code")
+                    stl = next(p for p, k in files if k == "stl")
+                    files += make_gcode(stl, folder / "out", "model", width)
         label = label + ("" if params.get("real_width_mm") else " (size not set)")
         assets = upload(api, sid, files, label, progress)
         api.finish(sid, assets)

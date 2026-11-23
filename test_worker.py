@@ -389,7 +389,7 @@ def test_a_flat_carving_job_needs_no_colmap_and_uploads_model_depth_and_gcode(tm
     out = w.process(api, {**scan(), "params": params}, tmp_path, reconstruct=lambda *a: used.append("colmap"), estimate=estimate)
     assert out == "done" and api.failed is None
     assert used == ["depth"]  # COLMAP is never touched for a flat carving
-    assert [a["kind"] for a in api.assets] == ["glb", "render", "nc", "render"]
+    assert [a["kind"] for a in api.assets] == ["glb", "render", "depth", "nc", "render"]
     assert all(a["visibility"] == "staff" for a in api.assets)
     assert "size not set" not in api.assets[0]["alt"]
 
@@ -397,11 +397,40 @@ def test_a_flat_carving_job_needs_no_colmap_and_uploads_model_depth_and_gcode(tm
 def test_a_flat_carving_without_a_width_still_gets_a_model_but_no_gcode(tmp_path, fake_http):
     api = FakeApi(photos=1)
     w.process(api, {**scan(), "params": {"shape": "relief"}}, tmp_path, estimate=gradient_depth)
-    assert [a["kind"] for a in api.assets] == ["glb", "render"]
+    assert [a["kind"] for a in api.assets] == ["glb", "render", "depth"]
     assert "size not set" in api.assets[0]["alt"]  # so nobody trusts its size
     bad = FakeApi(photos=1)
     assert w.process(bad, {**scan(), "params": {"shape": "relief", "gcode": True}}, tmp_path, estimate=gradient_depth) == "failed"
     assert "real width" in bad.failed
+
+
+def test_files_asked_for_later_are_made_from_the_kept_depth_map(tmp_path, fake_http, monkeypatch):
+    depth = relief.save_depth_png(gradient_depth(None), tmp_path / "master.png")
+    shape = lambda outputs, **kw: {"shape": "export", "real_width_mm": 80, "outputs": outputs, **kw}  # noqa: E731
+    got = {}
+    for outputs in (["nc"], ["stl", "obj"], ["glb"]):
+        files = w.export_files(depth, tmp_path / "-".join(outputs), shape(outputs), w.Progress(FakeApi(), "s1"))
+        got[tuple(outputs)] = sorted(k for _, k in files)
+    assert got == {("nc",): ["nc"], ("stl", "obj"): ["obj", "stl"], ("glb",): ["glb"]}  # only what was asked for
+    stl = trimesh.load(tmp_path / "stl-obj" / "out" / "relief.stl", force="mesh")
+    assert stl.extents[0] == pytest.approx(80, rel=1e-3)  # a real width, in millimetres
+    nc = next(p for p, k in w.export_files(depth, tmp_path / "again", shape(["nc"]), w.Progress(FakeApi(), "s1")) if k == "nc")
+    assert nc.read_text().startswith("G21")
+    with pytest.raises(RuntimeError, match="real width"):
+        w.export_files(depth, tmp_path / "x", shape(["nc"], real_width_mm=None), w.Progress(FakeApi(), "s1"))
+    with pytest.raises(RuntimeError, match="No files"):
+        w.export_files(depth, tmp_path / "y", shape([]), w.Progress(FakeApi(), "s1"))
+
+
+def test_an_export_job_downloads_the_depth_map_uploads_only_what_was_asked_and_never_runs_colmap(tmp_path, fake_http, monkeypatch):
+    out = tmp_path / "master.png"
+    relief.save_depth_png(gradient_depth(None), out)
+    monkeypatch.setattr(w, "download", lambda api, sid, dest, progress: [out])
+    api = FakeApi(photos=1)
+    params = {"shape": "export", "real_width_mm": 60, "outputs": ["stl", "nc"], "gcode": True}
+    state = w.process(api, {**scan(), "params": params}, tmp_path / "work", reconstruct=lambda *a: pytest.fail("COLMAP"))
+    assert state == "done" and api.failed is None
+    assert sorted(a["kind"] for a in api.assets) == ["nc", "stl"]
 
 
 def test_the_flat_carving_model_is_in_millimetres(tmp_path, fake_http, monkeypatch):
@@ -819,7 +848,7 @@ def test_a_marked_area_is_straightened_before_the_depth_is_read_and_flattened_af
     files = w.relief_files(photos, tmp_path / "work", {"real_width_mm": 600, "gcode": False, "crop": crop}, Quiet(), estimate=estimate)
     assert seen == [relief.area_size([tuple(p) for p in crop["quad"]])]  # the model read the straightened area, not the photo
     kinds = [k for _, k in files]
-    assert kinds == ["glb", "render"]
+    assert kinds == ["glb", "render", "depth"]
     picture = Image.open([p for p, k in files if k == "render"][0])
     assert picture.mode == "LA" and picture.getpixel((0, 0))[1] == 0  # shaped like the outline
     depth = np.asarray(Image.open(tmp_path / "work" / "depth.png")).astype(float) / 65535
@@ -846,5 +875,5 @@ def test_a_whole_job_for_a_marked_area_finishes(tmp_path, fake_http):
     params = {"shape": "relief", "real_width_mm": 600, "gcode": False, "label": "Headboard lotus", "crop": crop}
     out = w.process(api, {**scan(), "params": params}, tmp_path, estimate=gradient_depth)
     assert out == "done" and api.failed is None
-    assert [a["kind"] for a in api.assets] == ["glb", "render"]
+    assert [a["kind"] for a in api.assets] == ["glb", "render", "depth"]
 
