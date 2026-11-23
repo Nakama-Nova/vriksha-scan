@@ -195,6 +195,16 @@ def test_progress_only_renews_the_lease_when_a_minute_has_passed():
     assert len(api.calls) == sent + 1 and api.calls[-1] == "progress:15"
 
 
+def test_a_network_blip_while_reporting_progress_does_not_fail_the_job():
+    class Flaky(FakeApi):
+        def progress(self, sid, percent, note):
+            raise w.requests.ConnectTimeout("Connection to the server timed out")
+
+    p = w.Progress(Flaky(), "s1")
+    p.set(40, "Making the files")  # a missed update, nothing more
+    assert p.percent == 40
+
+
 def test_the_api_signs_in_again_when_the_token_expires(monkeypatch):
     seen = []
 

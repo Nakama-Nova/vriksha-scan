@@ -151,8 +151,8 @@ class Progress:
         self.last = self.clock()
         try:
             self.api.progress(self.sid, self.percent, self.note)
-        except ApiError:
-            pass  # a missed update is harmless; losing the lease shows up when we finish
+        except (ApiError, requests.RequestException):
+            pass  # a missed update is harmless (also a network blip: it once failed a whole job); losing the lease shows up when we finish
 
 
 def run(cmd, progress=None):
