@@ -12,7 +12,7 @@ import relief
 import workshop_worker as w
 
 MB = 1024 * 1024
-OK = {"relief": None, "full": None, "video": None}  # a PC that can build everything
+OK = {"relief": None, "full": None, "video": None, "suggest": None}  # a PC that can build everything
 
 
 def make_ply(path, faces_sub=3):
@@ -95,6 +95,10 @@ class FakeApi:
     def finish(self, sid, assets):
         self.calls.append("finish")
         self.assets = assets
+
+    def answer(self, sid, picks):
+        self.calls.append("answer")
+        self.picks = picks
 
     def fail(self, sid, error):
         self.calls.append("fail")
@@ -431,6 +435,28 @@ def test_an_export_job_downloads_the_depth_map_uploads_only_what_was_asked_and_n
     state = w.process(api, {**scan(), "params": params}, tmp_path / "work", reconstruct=lambda *a: pytest.fail("COLMAP"))
     assert state == "done" and api.failed is None
     assert sorted(a["kind"] for a in api.assets) == ["nc", "stl"]
+
+
+CHOICES = [{"id": "bed", "label": "a wooden bed"}, {"id": "chair", "label": "a wooden chair"}, {"id": "stool", "label": "a stool"}, {"id": "door", "label": "a door"}]
+
+
+def fake_clip(image, candidate_labels, hypothesis_template):
+    assert image.mode == "RGB" and "{}" in hypothesis_template
+    return [{"label": l, "score": s} for l, s in zip(candidate_labels, (0.1, 0.5, 0.3, 0.1))]  # unsorted on purpose
+
+
+def test_the_photo_is_matched_to_the_three_closest_choices_best_first(tmp_path):
+    photo = tmp_path / "p.jpg"
+    photo.write_bytes(JPEG)
+    assert w.suggest_picks(photo, CHOICES, fake_clip) == [{"id": "chair", "score": 0.5}, {"id": "stool", "score": 0.3}, {"id": "bed", "score": 0.1}]
+
+
+def test_a_suggest_job_answers_the_question_and_makes_no_files(tmp_path, fake_http):
+    api = FakeApi(photos=1)
+    state = w.process(api, {**scan(), "params": {"shape": "suggest", "choices": CHOICES}}, tmp_path, classify=fake_clip, reconstruct=lambda *a: pytest.fail("COLMAP"))
+    assert state == "done" and api.failed is None
+    assert api.picks[0]["id"] == "chair" and len(api.picks) == 3
+    assert "finish" not in api.calls and not any(c.startswith("presign") for c in api.calls)
 
 
 def test_the_flat_carving_model_is_in_millimetres(tmp_path, fake_http, monkeypatch):
