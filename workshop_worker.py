@@ -50,6 +50,7 @@ MB = 1024 * 1024
 # kind -> largest file the server accepts (media_service.PRIVATE_KINDS)
 LIMITS = {"glb": 100 * MB, "stl": 300 * MB, "obj": 300 * MB, "ply": 300 * MB, "nc": 50 * MB, "render": 15 * MB}
 CONTENT_TYPES = {".glb": "model/gltf-binary", ".stl": "model/stl", ".obj": "model/obj", ".ply": "application/octet-stream", ".nc": "text/plain", ".png": "image/png"}
+RELIEF_VIEW_SIDE = 512  # grid of the flat-carving 3D view: about 190,000 points
 COLMAP_QUALITY = {"fast": "low", "normal": "medium", "high": "high"}
 
 
@@ -228,10 +229,10 @@ def colmap_reconstruct(images, workspace, quality, progress, colmap="colmap"):
     return mesh
 
 
-def export_models(mesh_or_path, out, stem, width_mm=None, limits=None, mm=False):
+def export_models(mesh_or_path, out, stem, width_mm=None, limits=None, mm=False, only=None):
     """Write .glb .stl .obj .ply. The widest side becomes width_mm when known (mm=True says the mesh
     is already in millimetres). A model too big for the server is simplified, the same way for
-    every format, until each fits."""
+    every format, until each fits. only=(".glb",) writes just those formats."""
     limits = limits or LIMITS
     out.mkdir(parents=True, exist_ok=True)
     if isinstance(mesh_or_path, trimesh.Trimesh):
@@ -240,7 +241,7 @@ def export_models(mesh_or_path, out, stem, width_mm=None, limits=None, mm=False)
         mesh = trimesh.load(mesh_or_path, force="mesh")
     if width_mm and not mm:
         mesh.apply_scale(width_mm / max(mesh.extents))
-    formats = [(".glb", "glb"), (".stl", "stl"), (".obj", "obj"), (".ply", "ply")]
+    formats = [(e, k) for e, k in [(".glb", "glb"), (".stl", "stl"), (".obj", "obj"), (".ply", "ply")] if only is None or e in only]
     while True:
         files = []
         fits = True
@@ -308,7 +309,9 @@ def relief_files(images, folder, params, progress, estimate=None):
         depth = relief.flatten(depth, mask)  # no slope from the slanted photo; outside the outline is background
     width = params.get("real_width_mm")
     progress.set(70, "Making the 3D files")
-    files = export_models(relief.relief_mesh(depth, width or 100.0), out, "relief", mm=True)
+    # a flat carving is cut from the depth picture / G-code, so only a light .glb (for the 3D view) goes up:
+    # the dense mesh in four formats was about 200 MB for one 1600 mm area
+    files = export_models(relief.relief_mesh(depth, width or 100.0, side=RELIEF_VIEW_SIDE), out, "relief", mm=True, only=(".glb",))
     depth_png = relief.save_depth_png(depth, folder / "depth.png")
     files.append((relief.save_preview_png(depth, out / "relief-depth.png", mask=mask), "render"))
     if params.get("gcode"):
