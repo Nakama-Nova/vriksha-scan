@@ -118,6 +118,9 @@ STL, OBJ, PLY, GLB and CNC G-code are made **when someone asks** (the Lab's "Get
 `shape: export` whose only input is that depth map, and this worker builds just the files asked for, at the real width given. Update the **server first**,
 then this worker (the server must know the `depth` file kind before a worker uploads one).
 
+The **CAD folder** (`outputs: ["cad"]`) is one zip for a designer, made by `cad_pack.py`: `model.stl` and `model.obj`, `outline.dxf` and `outline.svg` (the outline of the carved area in millimetres,
+traced from the depth map), `depth-map.png` and a plain `README.txt`. The server must know the `cad` file kind first.
+
 ## Video to 3D on a free Colab GPU
 
 `colab/video_to_3d_colab.ipynb` (upload it in Colab, set the runtime to a T4 GPU, run the cells top to bottom) turns a video into a point cloud, keeps
